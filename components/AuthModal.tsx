@@ -3,20 +3,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '@/lib/auth-context';
 
-const USERS = {
-  admin: { h: '4e089f2da94eb0ca20d6914d33fd32a2c92e262e9daef473dd502e24ce25096c', r: 'Admin' },
-  viewer: { h: 'ad943c304c5b4aa137af856f43cdd030ff6198e172c3955a6b78dcdd2c41260a', r: 'Viewer' },
-};
-
-const sha = async (s: string) => {
-  if (typeof window !== 'undefined' && window.crypto && window.crypto.subtle) {
-    return [...new Uint8Array(await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)))]
-      .map((x) => x.toString(16).padStart(2, '0'))
-      .join('');
-  }
-  return '';
-};
-
 export default function AuthModal() {
   const { loginWithCredentials, signInWithGoogle } = useAuth();
   const [userId, setUserId] = useState('');

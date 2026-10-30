@@ -67,35 +67,38 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
         snapshot.forEach((d) => {
           const uData = { uid: d.id, ...(d.data() as Omit<UserProfile, 'uid'>) };
           list.push(uData);
-          initialEdits[d.id] = uData.password || '';
-          if (d.id === 'admin' || uData.email?.toLowerCase() === 'kayetavijit97@gmail.com') {
+          initialEdits[d.id] =
+            uData.password && !uData.password.startsWith('sha256:') ? uData.password : '';
+          if (d.id === 'admin' || uData.role === 'admin') {
             hasAdminDoc = true;
           }
         });
 
-        // Ensure default 'admin' account document exists in Firestore
+        // Ensure default 'admin' account document exists in Firestore via backend seed
         if (!hasAdminDoc) {
-          const defaultAdmin: UserProfile = {
-            uid: 'admin',
-            email: 'kayetavijit97@gmail.com',
-            displayName: 'admin',
-            role: 'admin',
-            status: 'approved',
-            password: 'admin',
-            assignedUnits: 'All',
-            createdAt: new Date().toISOString(),
-            lastLoginAt: 'System Master Admin',
-          };
           try {
-            await setDoc(doc(db, 'users', 'admin'), defaultAdmin, { merge: true });
-            await setDoc(doc(db, 'admins', 'admin'), {
-              uid: 'admin',
-              email: 'kayetavijit97@gmail.com',
-              assignedAt: new Date().toISOString(),
-            }, { merge: true });
-            list.unshift(defaultAdmin);
-            initialEdits['admin'] = 'admin';
-          } catch (e) {}
+            const seedRes = await fetch('/api/auth', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'get-bootstrap-admin-seed' }),
+            });
+            const seedData = await seedRes.json();
+            if (seedData?.ok && seedData?.adminRecord) {
+              const defaultAdmin = seedData.adminRecord as UserProfile;
+              await setDoc(doc(db, 'users', 'admin'), defaultAdmin, { merge: true });
+              await setDoc(
+                doc(db, 'admins', 'admin'),
+                {
+                  uid: 'admin',
+                  email: defaultAdmin.email,
+                  assignedAt: new Date().toISOString(),
+                },
+                { merge: true }
+              );
+              list.unshift(defaultAdmin);
+              initialEdits['admin'] = '';
+            }
+          } catch {}
         }
 
         setUsers(list);
@@ -110,6 +113,7 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
     );
 
     return () => unsubscribe();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin]);
 
   const handleUpdatePassword = async (targetUid: string) => {
@@ -117,14 +121,28 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
     if (val === undefined) return;
     const trimmed = val.trim();
     if (!trimmed) {
-      setStatusMsg({ text: 'Password cannot be blank.', type: 'error' });
+      setStatusMsg({ text: 'Please enter a new password before saving.', type: 'error' });
       return;
     }
     setSavingPasswordUid(targetUid);
     try {
+      const hashRes = await fetch('/api/auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'hash-password', password: trimmed }),
+      });
+      const hashData = await hashRes.json();
+      if (!hashRes.ok || !hashData?.hashedPassword) {
+        throw new Error(hashData?.error || 'Failed to hash password on backend');
+      }
+
       const userRef = doc(db, 'users', targetUid);
-      await setDoc(userRef, { password: trimmed }, { merge: true });
-      setStatusMsg({ text: `Password successfully assigned/updated for "${targetUid}"`, type: 'success' });
+      await setDoc(userRef, { password: hashData.hashedPassword }, { merge: true });
+      setPasswordEdits((prev) => ({ ...prev, [targetUid]: '' }));
+      setStatusMsg({
+        text: `Password securely hashed on backend & updated for "${targetUid}"`,
+        type: 'success',
+      });
       setTimeout(() => setStatusMsg(null), 3500);
     } catch (err: any) {
       setStatusMsg({ text: err.message || 'Failed to update password', type: 'error' });
@@ -212,6 +230,19 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
       const existing = users.find((u) => u.email.toLowerCase() === email || u.uid === rawInput.toLowerCase());
       const targetId = existing ? existing.uid : rawInput.toLowerCase().replace(/[^a-zA-Z0-9_-]/g, '_');
 
+      let hashedPassword = existing?.password || undefined;
+      if (assignedPass) {
+        const hashRes = await fetch('/api/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'hash-password', password: assignedPass }),
+        });
+        const hashData = await hashRes.json();
+        if (hashRes.ok && hashData?.hashedPassword) {
+          hashedPassword = hashData.hashedPassword;
+        }
+      }
+
       const userDocRef = doc(db, 'users', targetId);
       const record: UserProfile = {
         uid: targetId,
@@ -220,7 +251,7 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
         role: newRole,
         status: newStatus,
         assignedUnits: newUnits,
-        password: assignedPass || existing?.password || undefined,
+        ...(hashedPassword ? { password: hashedPassword } : {}),
         createdAt: existing?.createdAt || new Date().toISOString(),
         lastLoginAt: existing?.lastLoginAt || 'Not logged in yet',
       };
@@ -259,8 +290,7 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
           <AlertCircle className="w-12 h-12 text-amber-600 mx-auto mb-3" />
           <h3 className="text-base font-semibold text-slate-900">Administrator Access Required</h3>
           <p className="text-xs text-slate-600 mt-2">
-            Only designated administrators (such as <span className="font-mono">kayetavijit97@gmail.com</span>) can
-            manage user privileges and assign admin/editor access to other users.
+            Only designated system administrators can manage user privileges and assign admin/editor access to other users.
           </p>
           <button onClick={onClose} className="mt-5 px-4 py-2 bg-slate-900 text-white rounded-lg text-xs font-medium">
             Close Panel
@@ -542,7 +572,7 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
                       filteredUsers.map((u) => {
                         const isSelf = u.uid === user?.uid || u.email.toLowerCase() === user?.email?.toLowerCase();
                         const isVisible = visiblePasswords[u.uid] || false;
-                        const currentPassValue = passwordEdits[u.uid] !== undefined ? passwordEdits[u.uid] : (u.password || '');
+                        const currentPassValue = passwordEdits[u.uid] !== undefined ? passwordEdits[u.uid] : '';
 
                         return (
                           <tr key={u.uid} className="hover:bg-slate-50/70 transition-colors">
@@ -577,7 +607,7 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
                                       const val = e.target.value;
                                       setPasswordEdits((prev) => ({ ...prev, [u.uid]: val }));
                                     }}
-                                    placeholder="Set password..."
+                                    placeholder={u.password ? '•••••• (Reset)' : 'Set password...'}
                                     className="w-full text-xs font-mono px-2 py-1 pr-6 rounded border border-slate-200 bg-white focus:outline-none focus:ring-1 focus:ring-sky-600"
                                   />
                                   <button
@@ -593,7 +623,7 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
                                   type="button"
                                   onClick={() => handleUpdatePassword(u.uid)}
                                   disabled={savingPasswordUid === u.uid}
-                                  title="Save password to Cloud Firestore"
+                                  title="Hash on backend & save to Cloud Firestore"
                                   className="px-2 py-1 bg-sky-900 text-white rounded text-[11px] font-medium hover:bg-sky-800 transition-colors shrink-0 disabled:opacity-50 flex items-center gap-1"
                                 >
                                   <Save className="w-3 h-3" />
@@ -602,7 +632,7 @@ export default function AdminPanel({ onClose }: { onClose: () => void }) {
                               </div>
                               {u.password && (
                                 <div className="text-[10px] text-emerald-600 font-medium mt-0.5 flex items-center gap-1">
-                                  <Key className="w-2.5 h-2.5" /> Assigned
+                                  <Key className="w-2.5 h-2.5" /> Encrypted on Backend
                                 </div>
                               )}
                             </td>

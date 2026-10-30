@@ -11,7 +11,6 @@ import {
   doc,
   getDoc,
   setDoc,
-  updateDoc,
   collection,
   query,
   where,
@@ -19,9 +18,7 @@ import {
   limit,
 } from 'firebase/firestore';
 import { auth, db, googleProvider, testFirestoreConnection } from './firebase';
-import { UserProfile, UserRole, UserStatus } from './types';
-
-const ADMIN_BOOTSTRAP_EMAIL = 'kayetavijit97@gmail.com';
+import { UserProfile } from './types';
 
 interface AuthContextType {
   user: User | null;
@@ -59,131 +56,101 @@ const AuthContext = createContext<AuthContextType>({
 
 export const useAuth = () => useContext(AuthContext);
 
+function stripSecrets(profile: UserProfile): UserProfile {
+  const clean = { ...profile };
+  delete clean.password;
+  return clean;
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(() => {
     if (typeof window === 'undefined') return null;
     try {
-      const storedProfile = localStorage.getItem('nrep_user_profile') || sessionStorage.getItem('nrep_user_profile');
+      const storedProfile =
+        localStorage.getItem('nrep_user_profile') ||
+        sessionStorage.getItem('nrep_user_profile');
       if (storedProfile) {
-        return JSON.parse(storedProfile) as UserProfile;
+        return stripSecrets(JSON.parse(storedProfile) as UserProfile);
       }
-      const storedUser = localStorage.getItem('nrep_user') || sessionStorage.getItem('nrep_user');
-      if (storedUser === 'admin' || storedUser === 'viewer') {
-        const u = storedUser;
-        const role = u === 'admin' ? 'admin' : 'viewer';
-        return {
-          uid: u,
-          email: u === 'admin' ? ADMIN_BOOTSTRAP_EMAIL : `${u}@nrl.co.in`,
-          displayName: u,
-          role,
-          status: 'approved',
-          assignedUnits: 'All',
-          createdAt: new Date().toISOString(),
-          lastLoginAt: new Date().toISOString(),
-        };
-      }
-    } catch (e) {}
+    } catch {}
     return null;
   });
+  const [serverIsAdmin, setServerIsAdmin] = useState<boolean>(false);
   const [loading, setLoading] = useState(true);
   const [isGuest, setIsGuest] = useState(false);
   const [showLoginModal, setShowLoginModal] = useState(false);
 
-  // Sync profile to Firestore
-  const syncProfileToCloud = async (uProfile: UserProfile) => {
-    try {
-      const userRef = doc(db, 'users', uProfile.uid);
-      await setDoc(userRef, uProfile, { merge: true });
-      if (uProfile.role === 'admin') {
-        const adminRef = doc(db, 'admins', uProfile.uid);
-        await setDoc(adminRef, {
-          uid: uProfile.uid,
-          email: uProfile.email,
-          assignedAt: new Date().toISOString(),
-        }, { merge: true });
-      }
-    } catch (err) {
-      console.warn('Could not sync user profile to cloud:', err);
-    }
-  };
-
-  // Sync profile from Firebase Auth user
+  // Sync profile from Firebase Auth user via backend API (/api/auth)
   const syncProfile = async (firebaseUser: User) => {
     try {
       const userRef = doc(db, 'users', firebaseUser.uid);
       const userSnap = await getDoc(userRef);
+      const existingData = userSnap.exists()
+        ? ({ uid: userSnap.id, ...(userSnap.data() as Omit<UserProfile, 'uid'>) } as UserProfile)
+        : null;
 
-      const isBootstrapAdmin =
-        firebaseUser.email?.toLowerCase() === ADMIN_BOOTSTRAP_EMAIL.toLowerCase();
-
-      let currentProfile: UserProfile;
-
-      if (!userSnap.exists()) {
-        const initialRole: UserRole = isBootstrapAdmin ? 'admin' : 'viewer';
-        const initialStatus: UserStatus = isBootstrapAdmin ? 'approved' : 'pending';
-
-        currentProfile = {
+      const res = await fetch('/api/auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'sync-google-user',
           uid: firebaseUser.uid,
           email: firebaseUser.email || '',
-          displayName: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'Engineer',
-          role: initialRole,
-          status: initialStatus,
-          assignedUnits: 'All',
-          createdAt: new Date().toISOString(),
-          lastLoginAt: new Date().toISOString(),
-        };
+          displayName: firebaseUser.displayName || '',
+          existingProfile: existingData,
+        }),
+      });
 
-        await setDoc(userRef, currentProfile);
+      const data = await res.json();
+      if (data.ok && data.profile) {
+        const sanitized = stripSecrets(data.profile as UserProfile);
+        setProfile(sanitized);
+        setServerIsAdmin(Boolean(data.isAdmin));
 
-        if (isBootstrapAdmin) {
-          await setDoc(doc(db, 'admins', firebaseUser.uid), {
-            uid: firebaseUser.uid,
-            email: firebaseUser.email,
-            assignedAt: new Date().toISOString(),
-          });
+        try {
+          sessionStorage.setItem('nrep_user_profile', JSON.stringify(sanitized));
+          localStorage.setItem('nrep_user_profile', JSON.stringify(sanitized));
+        } catch {}
+
+        if (data.firestoreRecordToSync) {
+          await setDoc(userRef, data.firestoreRecordToSync, { merge: true });
         }
-      } else {
-        const data = userSnap.data() as UserProfile;
-        if (isBootstrapAdmin && (data.role !== 'admin' || data.status !== 'approved')) {
-          data.role = 'admin';
-          data.status = 'approved';
-          await setDoc(userRef, data, { merge: true });
-          await setDoc(doc(db, 'admins', firebaseUser.uid), {
-            uid: firebaseUser.uid,
-            email: firebaseUser.email,
-            assignedAt: new Date().toISOString(),
-          });
+        if (data.isBootstrapAdmin) {
+          await setDoc(
+            doc(db, 'admins', firebaseUser.uid),
+            {
+              uid: firebaseUser.uid,
+              email: firebaseUser.email,
+              assignedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
         }
-
-        currentProfile = {
-          ...data,
-          lastLoginAt: new Date().toISOString(),
-        };
-        await setDoc(userRef, { lastLoginAt: currentProfile.lastLoginAt }, { merge: true });
       }
-
-      setProfile(currentProfile);
-      sessionStorage.setItem('nrep_user_profile', JSON.stringify(currentProfile));
     } catch (error) {
       console.error('Error synchronizing user profile:', error);
-      const isBootstrapAdmin =
-        firebaseUser.email?.toLowerCase() === ADMIN_BOOTSTRAP_EMAIL.toLowerCase();
-      const fallback: UserProfile = {
-        uid: firebaseUser.uid,
-        email: firebaseUser.email || '',
-        displayName: firebaseUser.displayName || 'Engineer',
-        role: isBootstrapAdmin ? 'admin' : 'viewer',
-        status: isBootstrapAdmin ? 'approved' : 'pending',
-        createdAt: new Date().toISOString(),
-        lastLoginAt: new Date().toISOString(),
-      };
-      setProfile(fallback);
     }
   };
 
   useEffect(() => {
     testFirestoreConnection();
+
+    // Verify existing HttpOnly backend session on boot
+    fetch('/api/auth', { method: 'GET' })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data?.authenticated && data?.profile) {
+          const sanitized = stripSecrets(data.profile as UserProfile);
+          setProfile(sanitized);
+          setServerIsAdmin(Boolean(data.isAdmin));
+          try {
+            sessionStorage.setItem('nrep_user_profile', JSON.stringify(sanitized));
+            localStorage.setItem('nrep_user_profile', JSON.stringify(sanitized));
+          } catch {}
+        }
+      })
+      .catch(() => {});
 
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
@@ -209,7 +176,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  // Direct login with User ID / credentials (supports admin, viewer, and custom users with assigned passwords)
+  // Server-verified login with User ID / Email & Password via /api/auth
   const loginWithCredentials = async (usernameOrEmail: string, password?: string): Promise<boolean> => {
     const rawInput = usernameOrEmail.trim();
     const u = rawInput.toLowerCase();
@@ -218,24 +185,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     const sanitizedId = u.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-    // 1. Check if user document exists in Firestore
+    // 1. Check if user document exists in Firestore to pass to backend verifier
     let matchedProfile: UserProfile | null = null;
     let targetDocId = sanitizedId;
 
     try {
-      // Check direct docId (e.g. 'admin', 'viewer', or email sanitized)
       const directSnap = await getDoc(doc(db, 'users', sanitizedId));
       if (directSnap.exists()) {
         matchedProfile = { uid: directSnap.id, ...(directSnap.data() as Omit<UserProfile, 'uid'>) };
         targetDocId = directSnap.id;
       } else {
-        // Also check if doc exists with rawInput
         const rawSnap = await getDoc(doc(db, 'users', rawInput));
         if (rawSnap.exists()) {
           matchedProfile = { uid: rawSnap.id, ...(rawSnap.data() as Omit<UserProfile, 'uid'>) };
           targetDocId = rawSnap.id;
         } else {
-          // Query by email
           const qEmail = query(collection(db, 'users'), where('email', '==', u), limit(1));
           const emailSnap = await getDocs(qEmail);
           if (!emailSnap.empty) {
@@ -243,7 +207,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             matchedProfile = { uid: d.id, ...(d.data() as Omit<UserProfile, 'uid'>) };
             targetDocId = d.id;
           } else {
-            // Query by displayName (case-insensitive fallback)
             const qName = query(collection(db, 'users'), where('displayName', '==', rawInput), limit(1));
             const nameSnap = await getDocs(qName);
             if (!nameSnap.empty) {
@@ -258,125 +221,81 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       console.warn('Firestore user lookup note:', err.message);
     }
 
-    // 2. If user exists in Firestore
-    if (matchedProfile) {
-      if (matchedProfile.status === 'suspended') {
-        throw new Error('Your account has been suspended by the administrator.');
-      }
+    // 2. Delegate password & secret verification strictly to backend (/api/auth)
+    const response = await fetch('/api/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'verify-credentials',
+        usernameOrEmail: rawInput,
+        password: p,
+        firestoreUser: matchedProfile,
+      }),
+    });
 
-      // Check assigned password if set
-      if (matchedProfile.password && matchedProfile.password.trim() !== '') {
-        if (p !== matchedProfile.password.trim()) {
-          throw new Error('Incorrect password. Please try again.');
-        }
-      } else if (p && !matchedProfile.password) {
-        // If user had no password yet, assign this initial password
-        matchedProfile.password = p;
-        try {
-          await updateDoc(doc(db, 'users', targetDocId), { password: p });
-        } catch (e) {}
-      }
-
-      const activeProfile: UserProfile = {
-        ...matchedProfile,
-        lastLoginAt: new Date().toISOString(),
-      };
-
-      setProfile(activeProfile);
-      setIsGuest(false);
-      setShowLoginModal(false);
-
-      try {
-        localStorage.setItem('nrep_user', u);
-        localStorage.setItem('nrep_user_profile', JSON.stringify(activeProfile));
-        sessionStorage.setItem('nrep_user', u);
-        sessionStorage.setItem('nrep_user_profile', JSON.stringify(activeProfile));
-      } catch (e) {}
-
-      if (typeof window !== 'undefined') {
-        window.location.hash = '';
-        try {
-          history.replaceState(null, '', window.location.pathname);
-        } catch (e) {}
-      }
-
-      try {
-        await updateDoc(doc(db, 'users', targetDocId), { lastLoginAt: activeProfile.lastLoginAt });
-      } catch (e) {}
-
-      return true;
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      throw new Error(result.error || 'Invalid user ID or password.');
     }
 
-    // 3. Fallback for built-in accounts (admin / viewer / bootstrap email)
-    const isAdminUser = u === 'admin' || u === ADMIN_BOOTSTRAP_EMAIL.toLowerCase();
-    const isViewerUser = u === 'viewer';
+    const sanitizedProfile = stripSecrets(result.profile as UserProfile);
+    setProfile(sanitizedProfile);
+    setServerIsAdmin(Boolean(result.isAdmin));
+    setIsGuest(false);
+    setShowLoginModal(false);
 
-    if (isAdminUser || isViewerUser) {
-      const defaultRole: UserRole = isAdminUser ? 'admin' : 'viewer';
-      const defaultEmail = isAdminUser ? ADMIN_BOOTSTRAP_EMAIL : `${u}@nrl.co.in`;
-      const defaultName = isAdminUser ? 'admin' : 'viewer';
-      const assignedPassword = p || (isAdminUser ? 'admin123' : 'viewer123');
+    // Store only non-secret profile metadata in browser storage
+    try {
+      localStorage.setItem('nrep_user', sanitizedProfile.uid);
+      localStorage.setItem('nrep_user_profile', JSON.stringify(sanitizedProfile));
+      sessionStorage.setItem('nrep_user', sanitizedProfile.uid);
+      sessionStorage.setItem('nrep_user_profile', JSON.stringify(sanitizedProfile));
+    } catch {}
 
-      const newProf: UserProfile = {
-        uid: u,
-        email: defaultEmail,
-        displayName: defaultName,
-        role: defaultRole,
-        status: 'approved',
-        password: assignedPassword,
-        assignedUnits: 'All',
-        createdAt: new Date().toISOString(),
-        lastLoginAt: new Date().toISOString(),
-      };
-
-      setProfile(newProf);
-      setIsGuest(false);
-      setShowLoginModal(false);
-
+    if (typeof window !== 'undefined') {
+      window.location.hash = '';
       try {
-        localStorage.setItem('nrep_user', u);
-        localStorage.setItem('nrep_user_profile', JSON.stringify(newProf));
-        sessionStorage.setItem('nrep_user', u);
-        sessionStorage.setItem('nrep_user_profile', JSON.stringify(newProf));
-      } catch (e) {}
-
-      if (typeof window !== 'undefined') {
-        window.location.hash = '';
-        try {
-          history.replaceState(null, '', window.location.pathname);
-        } catch (e) {}
-      }
-
-      // Persist to Firestore so it appears in Admin Panel and syncs across devices
-      try {
-        await setDoc(doc(db, 'users', u), newProf, { merge: true });
-        if (isAdminUser) {
-          await setDoc(doc(db, 'admins', u), {
-            uid: u,
-            email: defaultEmail,
-            assignedAt: new Date().toISOString(),
-          }, { merge: true });
-        }
-      } catch (e) {}
-
-      return true;
+        history.replaceState(null, '', window.location.pathname);
+      } catch {}
     }
 
-    // 4. If neither registered in Firestore nor default account
-    throw new Error(`User "${rawInput}" is not found in registry. Please ask an Admin to grant you access.`);
+    // Sync server-prepared record (with hashed password) to Firestore
+    if (result.firestoreRecordToSync) {
+      const syncId = result.firestoreRecordToSync.uid || targetDocId;
+      try {
+        await setDoc(doc(db, 'users', syncId), result.firestoreRecordToSync, { merge: true });
+        if (result.isAdmin) {
+          await setDoc(
+            doc(db, 'admins', syncId),
+            {
+              uid: syncId,
+              email: result.firestoreRecordToSync.email,
+              assignedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
+        }
+      } catch {}
+    }
+
+    return true;
   };
 
   const signOut = async () => {
     try {
       await fbSignOut(auth);
-    } catch (error) {}
+    } catch {}
+    try {
+      await fetch('/api/auth', { method: 'DELETE' });
+    } catch {}
     try {
       sessionStorage.clear();
       localStorage.removeItem('nrep_user_profile');
       localStorage.removeItem('nrep_user');
-    } catch (e) {}
+    } catch {}
     setUser(null);
     setProfile(null);
+    setServerIsAdmin(false);
     setIsGuest(false);
     setShowLoginModal(true);
     if (typeof window !== 'undefined') {
@@ -397,11 +316,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const isAdmin =
-    profile?.role === 'admin' ||
-    user?.email?.toLowerCase() === ADMIN_BOOTSTRAP_EMAIL.toLowerCase() ||
-    profile?.email?.toLowerCase() === ADMIN_BOOTSTRAP_EMAIL.toLowerCase();
-
+  const isAdmin = profile?.role === 'admin' || serverIsAdmin;
   const isApproved = profile?.status === 'approved' || isAdmin;
   const isEditor = isAdmin || (isApproved && profile?.role === 'editor');
 
