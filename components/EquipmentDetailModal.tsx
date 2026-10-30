@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { EquipmentItem, STATUS_COLUMNS, STATUS_OPTIONS, isDone, isInProgress } from '@/lib/types';
+import { EquipmentItem, STATUS_COLUMNS, isDone, calculateProgress } from '@/lib/types';
 import { useEquipment } from '@/lib/equipment-context';
 import { useAuth } from '@/lib/auth-context';
 import { ExternalLink, Check, AlertCircle, Save, Trash2, X } from 'lucide-react';
@@ -92,40 +92,47 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
         <div className="p-6 overflow-y-auto flex-1 space-y-6">
           {/* Milestone Pipeline Stepper */}
           <div>
-            <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
-              Inspection Milestone Pipeline
-            </h4>
-            <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-2">
+            <div className="flex items-center justify-between mb-3">
+              <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                Inspection Milestone Pipeline (6 Stages)
+              </h4>
+              <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-sky-100 text-sky-900 border border-sky-200">
+                Stage Progress: {calculateProgress([formData])}%
+              </span>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">
               {STATUS_COLUMNS.map((col) => {
-                const val = (formData[col.key] as string) || '';
+                const rawVal = (formData[col.key] as string) || '';
+                const val = col.options.includes(rawVal as any)
+                  ? rawVal
+                  : isDone(rawVal)
+                  ? col.doneValue
+                  : col.pendingValue;
                 const done = isDone(val);
-                const prog = isInProgress(val);
                 return (
                   <div
                     key={col.key}
                     className={`p-2.5 rounded-lg border text-xs flex flex-col justify-between ${
                       done
-                        ? 'border-emerald-200 bg-emerald-50/50 text-emerald-900'
-                        : prog
-                        ? 'border-amber-200 bg-amber-50/50 text-amber-900'
-                        : 'border-slate-200 bg-slate-50/80 text-slate-600'
+                        ? 'border-emerald-300 bg-emerald-50/70 text-emerald-900'
+                        : 'border-amber-300 bg-amber-50/70 text-amber-900'
                     }`}
                   >
-                    <span className="font-medium text-[11px] text-slate-500">{col.short}</span>
+                    <span className="font-semibold text-[11px] text-slate-600">{col.short}</span>
                     {isEditor ? (
                       <select
                         value={val}
                         onChange={(e) => handleChange(col.key, e.target.value)}
-                        className="mt-1.5 text-xs bg-white border border-slate-200 rounded px-1.5 py-1 focus:ring-1 focus:ring-sky-600"
+                        className="mt-1.5 text-xs font-bold bg-white border border-slate-300 rounded px-1.5 py-1 focus:ring-1 focus:ring-sky-600"
                       >
-                        {STATUS_OPTIONS.map((opt) => (
+                        {col.options.map((opt) => (
                           <option key={opt} value={opt}>
-                            {opt || 'Select...'}
+                            {opt}
                           </option>
                         ))}
                       </select>
                     ) : (
-                      <span className="mt-1.5 font-semibold text-xs">{val || 'Not Started'}</span>
+                      <span className="mt-1.5 font-bold text-xs">{val}</span>
                     )}
                   </div>
                 );
@@ -157,7 +164,7 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
               />
             </div>
             <div>
-              <label className="block text-slate-500 font-medium mb-1">Unit / Package</label>
+              <label className="block text-slate-500 font-medium mb-1">Unit</label>
               <input
                 type="text"
                 disabled={!isEditor}
@@ -178,22 +185,13 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
               />
             </div>
             <div>
-              <label className="block text-slate-500 font-medium mb-1">Area / Package</label>
+              <label className="block text-slate-500 font-medium mb-1">Punch Points Category Closed</label>
               <input
                 type="text"
                 disabled={!isEditor}
-                value={formData.AreaPackage || ''}
-                onChange={(e) => handleChange('AreaPackage', e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
-              />
-            </div>
-            <div>
-              <label className="block text-slate-500 font-medium mb-1">RFI No.</label>
-              <input
-                type="text"
-                disabled={!isEditor}
-                value={formData.RFINo || ''}
-                onChange={(e) => handleChange('RFINo', e.target.value)}
+                value={formData.PunchPointsCategoryClosed || ''}
+                onChange={(e) => handleChange('PunchPointsCategoryClosed', e.target.value)}
+                placeholder="e.g. A, B, or All Closed"
                 className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
               />
             </div>
@@ -228,41 +226,9 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
                 className="w-full px-3 py-1.5 rounded-lg border border-slate-200 font-mono text-xs bg-white disabled:bg-slate-50"
               />
             </div>
-
-            <div>
-              <label className="block text-slate-500 font-medium mb-1">Punch Points Category Closed</label>
-              <input
-                type="text"
-                disabled={!isEditor}
-                value={formData.PunchPointsCategoryClosed || ''}
-                onChange={(e) => handleChange('PunchPointsCategoryClosed', e.target.value)}
-                placeholder="e.g. A, B, or All Closed"
-                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
-              />
-            </div>
-            <div>
-              <label className="block text-slate-500 font-medium mb-1">Last Inspection Date</label>
-              <input
-                type="date"
-                disabled={!isEditor}
-                value={formData.LastInspectionDate || ''}
-                onChange={(e) => handleChange('LastInspectionDate', e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 font-mono text-xs bg-white disabled:bg-slate-50"
-              />
-            </div>
-            <div>
-              <label className="block text-slate-500 font-medium mb-1">Responsible Agency / Vendor</label>
-              <input
-                type="text"
-                disabled={!isEditor}
-                value={formData.ResponsibleAgency || ''}
-                onChange={(e) => handleChange('ResponsibleAgency', e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
-              />
-            </div>
           </div>
 
-          {/* Description & Remarks */}
+          {/* Description, Document/Drawing & Remarks */}
           <div className="space-y-3 text-xs">
             <div>
               <label className="block text-slate-500 font-medium mb-1">Equipment Description</label>
@@ -275,6 +241,30 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
               />
             </div>
             <div>
+              <label className="block text-slate-500 font-medium mb-1">Document/Drawing (Number or URL)</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  disabled={!isEditor}
+                  value={formData.DocumentDrawing || ''}
+                  onChange={(e) => handleChange('DocumentDrawing', e.target.value)}
+                  placeholder="e.g. DWG-RPTU-V101-01 or https://..."
+                  className="flex-1 px-3 py-1.5 rounded-lg border border-slate-200 font-mono text-xs bg-white disabled:bg-slate-50"
+                />
+                {formData.DocumentDrawing && /^https?:\/\//i.test(formData.DocumentDrawing) && (
+                  <a
+                    href={formData.DocumentDrawing}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-sky-50 text-sky-800 hover:bg-sky-100 font-medium"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    Open Document
+                  </a>
+                )}
+              </div>
+            </div>
+            <div>
               <label className="block text-slate-500 font-medium mb-1">Engineer Remarks & Punch Notes</label>
               <textarea
                 rows={2}
@@ -284,30 +274,6 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
                 placeholder="Enter field observations, hydrotest records, punch point remarks..."
                 className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
               />
-            </div>
-            <div>
-              <label className="block text-slate-500 font-medium mb-1">Document Link / URL</label>
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  disabled={!isEditor}
-                  value={formData.Link || ''}
-                  onChange={(e) => handleChange('Link', e.target.value)}
-                  placeholder="https://..."
-                  className="flex-1 px-3 py-1.5 rounded-lg border border-slate-200 font-mono text-xs bg-white disabled:bg-slate-50"
-                />
-                {formData.Link && (
-                  <a
-                    href={formData.Link}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-sky-50 text-sky-800 hover:bg-sky-100 font-medium"
-                  >
-                    <ExternalLink className="w-3.5 h-3.5" />
-                    Open Link
-                  </a>
-                )}
-              </div>
             </div>
           </div>
         </div>

@@ -52,7 +52,7 @@ export default function ExcelUploadModal({ isOpen, onClose }: ExcelUploadModalPr
 
       const headers: string[] = aoa[headerIndex].map((h) => String(h || '').trim());
       const tagIndex = headers.findIndex((h) => h.toLowerCase() === 'equipment tag no.');
-      const linkIndex = headers.findIndex((h) => /^(link|hyperlink|url)/i.test(h));
+      const docIndex = headers.findIndex((h) => /^(document\s*\/\s*drawing|document|drawing)/i.test(h));
 
       const rows: any[] = [];
       let currentUnit = '';
@@ -80,12 +80,15 @@ export default function ExcelUploadModal({ isOpen, onClose }: ExcelUploadModalPr
         if (rowObj['System No.']) currentSystem = rowObj['System No.'];
         else rowObj['System No.'] = currentSystem || 'General System';
 
-        // Check cell hyperlink if present
-        const cell = ws[XLSX.utils.encode_cell({ r, c: tagIndex })];
-        if (cell && cell.l && cell.l.Target) {
-          rowObj.Link = cell.l.Target;
-        } else if (linkIndex >= 0 && rowObj[headers[linkIndex]]) {
-          rowObj.Link = rowObj[headers[linkIndex]];
+        // Check cell hyperlink if present on Tag or Document/Drawing cell
+        const docCell = docIndex >= 0 ? ws[XLSX.utils.encode_cell({ r, c: docIndex })] : null;
+        const tagCell = ws[XLSX.utils.encode_cell({ r, c: tagIndex })];
+        if (docCell && docCell.l && docCell.l.Target) {
+          rowObj['Document/Drawing'] = docCell.l.Target;
+        } else if (docIndex >= 0 && rowObj[headers[docIndex]]) {
+          rowObj['Document/Drawing'] = rowObj[headers[docIndex]];
+        } else if (tagCell && tagCell.l && tagCell.l.Target && !rowObj['Document/Drawing']) {
+          rowObj['Document/Drawing'] = tagCell.l.Target;
         }
 
         rows.push(rowObj);

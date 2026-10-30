@@ -7,6 +7,7 @@ import { useEquipment } from '@/lib/equipment-context';
 import {
   EquipmentItem,
   UNITS,
+  UTILITY_SUB_UNITS,
   STATUS_COLUMNS,
   STATUS_OPTIONS,
   isDone,
@@ -30,7 +31,7 @@ import {
   X,
 } from 'lucide-react';
 
-type ViewLevel = 'p' | 'u' | 's' | 'e';
+type ViewLevel = 'p' | 'u' | 's' | 'e' | 'tools' | 'admin';
 
 export default function Dashboard() {
   const {
@@ -60,11 +61,11 @@ export default function Dashboard() {
   const [selectedSystemName, setSelectedSystemName] = useState<string | null>(null);
   const [selectedEquipmentTag, setSelectedEquipmentTag] = useState<string | null>(null);
 
-  // Drawer tree state & active tab
+  // Drawer tree state (UTILITY and its first Sub-Unit DM-CPU expanded by default so the full revised hierarchy is immediately visible)
   const [treeOpen, setTreeOpen] = useState(false);
-  const [treeTab, setTreeTab] = useState<'hierarchy' | 'tools' | 'admin'>('hierarchy');
   const [treeFilter, setTreeFilter] = useState('');
-  const [expandedUnits, setExpandedUnits] = useState<Set<string>>(new Set());
+  const [expandedUnits, setExpandedUnits] = useState<Set<string>>(() => new Set(['unit-1', 'unit-7']));
+  const [expandedSystems, setExpandedSystems] = useState<Set<string>>(() => new Set(['system-7-1']));
 
   // Global search & drop-down
   const [globalSearch, setGlobalSearch] = useState('');
@@ -76,6 +77,7 @@ export default function Dashboard() {
   // In-place direct equipment editing & Modals
   const [editingEquipment, setEditingEquipment] = useState<EquipmentItem | null>(null);
   const [showAdminPanel, setShowAdminPanel] = useState(false);
+  const [excelNotice, setExcelNotice] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   // KPI expanded details drilldown
   const [kpiFilter, setKpiFilter] = useState<string | null>(null);
@@ -90,7 +92,7 @@ export default function Dashboard() {
   const [unitSortBy, setUnitSortBy] = useState<'progress-desc' | 'progress-asc' | 'name' | 'pending-desc'>('progress-desc');
   const [unitMetricType, setUnitMetricType] = useState<'stage' | 'equip'>('stage');
   const [unitChartSearch, setUnitChartSearch] = useState('');
-  const [unitChartLayout, setUnitChartLayout] = useState<'vertical-twin' | 'vertical-stacked' | 'horizontal'>('vertical-twin');
+  const [unitChartLayout, setUnitChartLayout] = useState<'vertical-twin' | 'vertical-stacked'>('vertical-twin');
   const [hoveredUnitPillar, setHoveredUnitPillar] = useState<string | null>(null);
 
   // Hidden file input for Excel upload
@@ -116,24 +118,45 @@ export default function Dashboard() {
     setTreeOpen(false);
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'smooth' });
+      document.getElementById('main')?.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
 
-  // Units list containing standard plus any dynamic units in rows
+  // Canonical 7 Units list: RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB, UTILITY
   const allUnitsList = useMemo(() => {
-    const list = [...UNITS];
-    equipment.forEach((item) => {
-      if (item.Unit && !list.includes(item.Unit)) {
-        list.push(item.Unit);
-      }
-    });
-    return list;
-  }, [equipment]);
+    return [...UNITS];
+  }, []);
 
-  // Tree data structure
+  // Tree data structure:
+  // - 7 Top-Level Units: RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB, UTILITY
+  // - First 6 Units (RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB): Equipment resides directly inside the Unit
+  // - 7th Unit (UTILITY): 8 Sub-Units (DM-CPU, N2U, CA-IA, BOILERS AND HRSG, COOLING TOWER, RWDU, RW FILTER, RW RESERVOIR) -> Equipment resides inside each Sub-Unit
   const treeData = useMemo(() => {
     return allUnitsList.map((unitName, uIdx) => {
       const unitItems = equipment.filter((i) => i.Unit === unitName);
+
+      if (unitName === 'UTILITY') {
+        const subUnitsList = [...UTILITY_SUB_UNITS];
+        unitItems.forEach((item) => {
+          const su = item.SubUnit || item.AreaPackage || item.SystemNo;
+          if (su && !subUnitsList.includes(su)) {
+            subUnitsList.push(su);
+          }
+        });
+        return {
+          name: unitName,
+          id: `unit-${uIdx + 1}`,
+          items: unitItems,
+          systems: subUnitsList.map((subName, sIdx) => ({
+            name: subName,
+            id: `system-${uIdx + 1}-${sIdx + 1}`,
+            items: unitItems.filter(
+              (i) => (i.SubUnit || i.AreaPackage || i.SystemNo) === subName
+            ),
+          })),
+        };
+      }
+
       const uniqueSystems = [...new Set(unitItems.map((i) => i.SystemNo).filter(Boolean))];
       return {
         name: unitName,
@@ -154,10 +177,27 @@ export default function Dashboard() {
       const hash = window.location.hash.slice(1);
       setKpiFilter(null);
       setKpiSearch('');
+      document.getElementById('main')?.scrollTo({ top: 0, behavior: 'smooth' });
 
       // Default or empty hash always stays cleanly on Home (level 'p')
       if (!hash || hash === 'home' || hash === 'lg' || hash === 'login' || hash === '#') {
         setViewLevel('p');
+        setSelectedUnitName(null);
+        setSelectedSystemName(null);
+        setSelectedEquipmentTag(null);
+        return;
+      }
+
+      if (hash === 'tools') {
+        setViewLevel('tools');
+        setSelectedUnitName(null);
+        setSelectedSystemName(null);
+        setSelectedEquipmentTag(null);
+        return;
+      }
+
+      if (hash === 'admin') {
+        setViewLevel('admin');
         setSelectedUnitName(null);
         setSelectedSystemName(null);
         setSelectedEquipmentTag(null);
@@ -187,6 +227,7 @@ export default function Dashboard() {
           setSelectedSystemName(s.name);
           setSelectedEquipmentTag(null);
           setExpandedUnits((prev) => new Set([...prev, u.id]));
+          setExpandedSystems((prev) => new Set([...prev, s.id]));
           return;
         }
       }
@@ -198,7 +239,7 @@ export default function Dashboard() {
         if (item) {
           setViewLevel('e');
           setSelectedUnitName(item.Unit);
-          setSelectedSystemName(item.SystemNo);
+          setSelectedSystemName(item.Unit === 'UTILITY' ? (item.SubUnit || item.AreaPackage || item.SystemNo) : item.SystemNo);
           setSelectedEquipmentTag(item.EquipmentTagNo);
           return;
         }
@@ -219,23 +260,41 @@ export default function Dashboard() {
   // Click outside to close search dropdown and collapse empty search box
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (searchContainerRef.current && !searchContainerRef.current.contains(e.target as Node)) {
+      const target = e.target as Node | null;
+      if (!target || !document.body.contains(target)) return;
+      if (searchContainerRef.current && !searchContainerRef.current.contains(target)) {
         setShowGlobalResults(false);
         if (!searchInputRef.current?.value.trim()) {
           setSearchBoxOpen(false);
         }
       }
     };
-    document.addEventListener('click', handleClickOutside);
-    return () => document.removeEventListener('click', handleClickOutside);
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  // Auto-focus search input when search box opens
+  useEffect(() => {
+    if (searchBoxOpen) {
+      const timer = setTimeout(() => {
+        searchInputRef.current?.focus();
+      }, 10);
+      return () => clearTimeout(timer);
+    }
+  }, [searchBoxOpen]);
 
   // Scope equipment calculation
   const scopeItems = useMemo(() => {
     if (viewLevel === 'p') return equipment;
     if (viewLevel === 'u' && selectedUnitName) return equipment.filter((i) => i.Unit === selectedUnitName);
     if (viewLevel === 's' && selectedUnitName && selectedSystemName) {
-      return equipment.filter((i) => i.Unit === selectedUnitName && i.SystemNo === selectedSystemName);
+      return equipment.filter((i) => {
+        if (i.Unit !== selectedUnitName) return false;
+        if (selectedUnitName === 'UTILITY') {
+          return (i.SubUnit || i.AreaPackage || i.SystemNo) === selectedSystemName;
+        }
+        return i.SystemNo === selectedSystemName;
+      });
     }
     return equipment;
   }, [viewLevel, selectedUnitName, selectedSystemName, equipment]);
@@ -525,7 +584,7 @@ export default function Dashboard() {
     }).length;
   };
 
-  // Excel Upload Handler matching reference HTML
+  // Excel Upload Handler matching revised 18-column schema
   const handleExcelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -546,7 +605,7 @@ export default function Dashboard() {
 
       const headers: string[] = aoa[headerIndex].map((h) => String(h || '').trim());
       const tagIndex = headers.findIndex((h) => h.toLowerCase() === 'equipment tag no.');
-      const linkIndex = headers.findIndex((h) => /^(link|hyperlink|url)/i.test(h));
+      const docDrawIndex = headers.findIndex((h) => /^(document\s*\/?\s*drawing|drawing|document)/i.test(h));
 
       const rows: any[] = [];
       let curUnit = '';
@@ -573,160 +632,150 @@ export default function Dashboard() {
         if (obj['System No.']) curSys = obj['System No.'];
         else obj['System No.'] = curSys || 'System not assigned';
 
-        const cell = ws[XLSX.utils.encode_cell({ r, c: tagIndex })];
-        if (cell && cell.l && cell.l.Target) obj.Link = cell.l.Target;
-        else if (linkIndex >= 0 && obj[headers[linkIndex]]) obj.Link = obj[headers[linkIndex]];
+        // Support hyperlinks on Document/Drawing cell or Equipment Tag No. cell
+        const docCell = docDrawIndex >= 0 ? ws[XLSX.utils.encode_cell({ r, c: docDrawIndex })] : null;
+        const tagCell = ws[XLSX.utils.encode_cell({ r, c: tagIndex })];
+        if (docCell && docCell.l && docCell.l.Target && !obj['Document/Drawing']) {
+          obj['Document/Drawing'] = docCell.l.Target;
+        } else if (tagCell && tagCell.l && tagCell.l.Target && !obj['Document/Drawing']) {
+          obj['Document/Drawing'] = tagCell.l.Target;
+        }
 
         rows.push(obj);
       }
 
       const res = await importFromExcel(rows);
-      window.location.hash = '';
-      alert(`${rows.length} equipment loaded and synced with Cloud Firestore! (${res.added} added, ${res.updated} updated)`);
+      setExcelNotice({
+        type: 'ok',
+        text: `${rows.length} equipment loaded and synced with Cloud Firestore! (${res.added} added, ${res.updated} updated)`,
+      });
     } catch (err: any) {
-      alert('Upload failed: ' + err.message);
+      setExcelNotice({
+        type: 'err',
+        text: 'Upload failed: ' + (err.message || 'Invalid Excel file'),
+      });
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
-  // Excel Download Handler
+  // Excel Download Handler (Revised 18 Columns — removed Area/Package, RFI No., Category-A Status, Media Filling Clearance, Last Inspection Date, Responsible Agency/Person, Link; added Base Line UTG & Document/Drawing)
   const handleExcelDownload = () => {
     const H = [
       'Unit',
-      'Area / Package',
+      'Sub-Unit',
       'System No.',
       'Equipment Tag No.',
       'Equipment Description',
       'Equipment Type',
-      'RFI No.',
       'Format-I Status',
       'Format-I Date',
       'Format-II Status',
       'Format-II Date',
       'Format-III Status',
       'Format-III Date',
-      'Category-A Status',
       'Internal Inspection Status',
-      'Media Filling Clearance',
+      'Base Line UTG',
       'Punch Points Category Closed',
       'Final System Acceptance',
-      'Last Inspection Date',
-      'Responsible Agency / Person',
+      'Document/Drawing',
       'Remarks',
-      'Link',
     ];
 
     const data = equipment.map((r) => [
       r.Unit || '',
-      r.AreaPackage || '',
+      r.Unit === 'UTILITY' ? (r.SubUnit || r.SystemNo || '') : '',
       r.SystemNo || '',
       r.EquipmentTagNo || '',
       r.EquipmentDescription || '',
       r.EquipmentType || '',
-      r.RFINo || '',
       r.FormatIStatus || '',
       r.FormatIDate || '',
       r.FormatIIStatus || '',
       r.FormatIIDate || '',
       r.FormatIIIStatus || '',
       r.FormatIIIDate || '',
-      r.CategoryAStatus || '',
       r.InternalInspectionStatus || '',
-      r.MediaFillingClearance || '',
+      r.BaseLineUTG || '',
       r.PunchPointsCategoryClosed || '',
       r.FinalSystemAcceptance || '',
-      r.LastInspectionDate || '',
-      r.ResponsibleAgency || '',
+      r.DocumentDrawing || '',
       r.Remarks || '',
-      r.Link || '',
     ]);
 
-    const ws = XLSX.utils.aoa_to_sheet([['NREP UTILITY EQUIPMENT LIST'], H, ...data]);
+    const ws = XLSX.utils.aoa_to_sheet([['NREP EQUIPMENT MASTER LIST'], H, ...data]);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Equipment Master');
     XLSX.writeFile(wb, 'NREP_Inspection_Equipment_Tracker_updated.xlsx');
   };
 
-  // Excel Template Download Handler
+  // Excel Template Download Handler (Revised 18 Columns)
   const handleDownloadTemplate = () => {
     const H = [
       'Unit',
-      'Area / Package',
+      'Sub-Unit',
       'System No.',
       'Equipment Tag No.',
       'Equipment Description',
       'Equipment Type',
-      'RFI No.',
       'Format-I Status',
       'Format-I Date',
       'Format-II Status',
       'Format-II Date',
       'Format-III Status',
       'Format-III Date',
-      'Category-A Status',
       'Internal Inspection Status',
-      'Media Filling Clearance',
+      'Base Line UTG',
       'Punch Points Category Closed',
       'Final System Acceptance',
-      'Last Inspection Date',
-      'Responsible Agency / Person',
+      'Document/Drawing',
       'Remarks',
-      'Link',
     ];
 
     const sampleRows = [
       [
-        'Unit-1 (Crude Distillation)',
-        'ISBL Area A',
-        'System-01 (Cooling Water)',
-        '01-P-101A',
-        'Crude Feed Pump A',
-        'Pump',
-        'RFI-CDU-001',
-        'Completed',
-        '2026-03-15',
-        'Completed',
-        '2026-03-20',
-        'In progress',
+        'RPTU',
         '',
-        'Not started',
-        'Not started',
-        'Not started',
-        'Not started',
-        'Not started',
-        '2026-03-20',
-        'L&T Commissioning Team',
-        'Vibration check completed',
-        'https://example.com/docs/01-P-101A.pdf',
+        'RPTU-SYS-01',
+        'RPTU-R-1001A',
+        'RPTU Ebullated Bed Reactor #1',
+        'Reactor',
+        'Issued',
+        '2026-01-12',
+        'Issued',
+        '2026-02-05',
+        'Issued',
+        '2026-02-20',
+        'Yes',
+        'Yes',
+        'A',
+        'Accept',
+        'NRL-RPTU-GA-1001A Rev.2',
+        'Internal inspection completed',
       ],
       [
-        'Unit-1 (Crude Distillation)',
-        'ISBL Area A',
-        'System-01 (Cooling Water)',
-        '01-P-101B',
-        'Crude Feed Pump B',
-        'Pump',
-        'RFI-CDU-002',
-        'In progress',
-        '2026-03-18',
-        'Not started',
-        '',
-        'Not started',
-        '',
-        'Not started',
-        'Not started',
-        'Not started',
-        'Not started',
-        'Not started',
-        '2026-03-18',
-        'L&T Commissioning Team',
-        'Alignment under progress',
-        '',
+        'UTILITY',
+        'DM-CPU',
+        'DM-CPU',
+        '1U59-TT-4831',
+        'Equalization Tank',
+        'Tank',
+        'Issued',
+        '2025-08-21',
+        'Issued',
+        '2026-03-27',
+        'Issued',
+        '2026-04-23',
+        'Yes',
+        'Yes',
+        'A',
+        'Accept',
+        'NRL-UTIL-DM-4831 Rev.2',
+        'Hydrostatic test complete',
       ],
     ];
 
-    const ws = XLSX.utils.aoa_to_sheet([['NREP UTILITY EQUIPMENT LIST - TEMPLATE'], H, ...sampleRows]);
+    const ws = XLSX.utils.aoa_to_sheet([['NREP EQUIPMENT LIST - TEMPLATE (Units: RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB, UTILITY)'], H, ...sampleRows]);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Equipment Master');
     XLSX.writeFile(wb, 'NREP_Equipment_Upload_Template.xlsx');
@@ -735,7 +784,7 @@ export default function Dashboard() {
   // Search Results Filtering
   const globalSearchResults = useMemo(() => {
     const q = globalSearch.trim().toLowerCase();
-    if (q.length < 2) return null;
+    if (q.length < 1) return null;
 
     const matchedUnits = treeData.filter((u) => u.name.toLowerCase().includes(q)).slice(0, 5);
     const matchedSystems = treeData
@@ -750,7 +799,13 @@ export default function Dashboard() {
   }, [globalSearch, treeData, equipment]);
 
   // Donut Ring Chart SVG
-  const renderDonutChart = (s: { total: number; completed: number; inProgress: number; notStarted: number }) => {
+  const renderDonutChart = (s: {
+    total: number;
+    completed: number;
+    inProgress: number;
+    notStarted: number;
+    progressPct?: number;
+  }) => {
     const t = s.total || 1;
     const slices = [
       { val: s.completed, color: 'var(--gr)' },
@@ -778,7 +833,7 @@ export default function Dashboard() {
       return el;
     });
 
-    const completedPct = Math.round((s.completed / t) * 100);
+    const displayPct = s.progressPct !== undefined ? s.progressPct : Math.round((s.completed / t) * 100);
 
     return (
       <>
@@ -786,21 +841,21 @@ export default function Dashboard() {
           <svg viewBox="0 0 36 36" width="140" height="140">
             <g transform="rotate(-90 18 18)">{circleElements}</g>
             <text x="18" y="19" textAnchor="middle" fontSize="6" fontWeight="700" fill="currentColor">
-              {completedPct}%
+              {displayPct}%
             </text>
-            <text x="18" y="23.5" textAnchor="middle" fontSize="2.4" fill="currentColor">
-              completed
+            <text x="18" y="23.5" textAnchor="middle" fontSize="2.2" fill="currentColor">
+              stage progress
             </text>
           </svg>
           <div className="dl">
             <div>
-              <b>{s.completed}</b>Completed
+              <b>{s.completed}</b>Completed (100%)
             </div>
             <div>
               <b>{s.inProgress}</b>In progress
             </div>
             <div>
-              <b>{s.notStarted}</b>Not started
+              <b>{s.notStarted}</b>Not started (0%)
             </div>
           </div>
         </div>
@@ -825,92 +880,86 @@ export default function Dashboard() {
 
     return (
       <>
-        {STATUS_COLUMNS.map((col, idx) => {
+        {STATUS_COLUMNS.map((col) => {
           let done = 0;
-          let open = 0;
-          let notStarted = 0;
-          let na = 0;
+          let pending = 0;
 
           items.forEach((r) => {
-            const val = ((r[col.key] as string) || '').trim().toLowerCase();
-            if (!val || val === 'not started') notStarted++;
-            else if (val === 'not applicable') na++;
-            else if (isDone(val)) done++;
-            else open++;
+            const val = (r[col.key] as string) || '';
+            if (isDone(val)) done++;
+            else pending++;
           });
 
-          const totalApplicable = t - na;
+          const pct = items.length ? Math.round((done / t) * 100) : 0;
 
           return (
             <div key={col.key} className="sr">
-              <span>{col.short}</span>
+              <span title={`${col.label} (${col.doneValue} / ${col.pendingValue})`}>{col.short}</span>
               <div className="sb">
                 {done > 0 && (
                   <i
-                    title={`Done: ${done}`}
+                    title={`${col.doneValue}: ${done} (${pct}%)`}
                     style={{ width: `${(done / t) * 100}%`, background: 'var(--gr)' }}
                   />
                 )}
-                {open > 0 && (
+                {pending > 0 && (
                   <i
-                    title={`Pending / Open: ${open}`}
-                    style={{ width: `${(open / t) * 100}%`, background: 'var(--am)' }}
-                  />
-                )}
-                {notStarted > 0 && (
-                  <i
-                    title={`Not started: ${notStarted}`}
-                    style={{ width: `${(notStarted / t) * 100}%`, background: 'var(--sl)' }}
-                  />
-                )}
-                {na > 0 && (
-                  <i
-                    title={`N/A: ${na}`}
-                    style={{ width: `${(na / t) * 100}%`, background: 'var(--bd)' }}
+                    title={`${col.pendingValue}: ${pending} (${100 - pct}%)`}
+                    style={{ width: `${(pending / t) * 100}%`, background: 'var(--am)' }}
                   />
                 )}
               </div>
-              <b>
-                {done}/{totalApplicable}
+              <b style={{ minWidth: '58px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                {done}/{items.length} ({pct}%)
               </b>
             </div>
           );
         })}
         <div className="lg">
           <span>
-            <i style={{ background: 'var(--gr)' }}></i>Done
+            <i style={{ background: 'var(--gr)' }}></i>Done (Issued / Yes / Accept)
           </span>
           <span>
-            <i style={{ background: 'var(--am)' }}></i>Pending / Open
-          </span>
-          <span>
-            <i style={{ background: 'var(--sl)' }}></i>Not started
-          </span>
-          <span>
-            <i style={{ background: 'var(--bd)' }}></i>N/A
+            <i style={{ background: 'var(--am)' }}></i>Pending (Not Issued / No / Not accept)
           </span>
         </div>
       </>
     );
   };
 
-  // Segmented bar for matrix table rows
+  // Segmented bar for matrix table rows showing exact dropdown-calculated progress %
   const renderMiniProgressBar = (items: EquipmentItem[]) => {
-    const t = items.length || 1;
-    let d = 0;
-    let p = 0;
-    items.forEach((r) => {
-      const st = getEquipmentOverallStatus(r);
-      if (st === 'Completed') d++;
-      else if (st === 'In progress') p++;
-    });
-    const n = t - d - p;
+    const pct = calculateProgress(items);
+    const remPct = Math.max(0, 100 - pct);
 
     return (
-      <div className="sb">
-        {d > 0 && <i title={`Completed: ${d}`} style={{ width: `${(d / t) * 100}%`, background: 'var(--gr)' }} />}
-        {p > 0 && <i title={`In progress: ${p}`} style={{ width: `${(p / t) * 100}%`, background: 'var(--am)' }} />}
-        {n > 0 && <i title={`Not started: ${n}`} style={{ width: `${(n / t) * 100}%`, background: 'var(--sl)' }} />}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <span
+          style={{
+            fontSize: '11px',
+            fontWeight: 800,
+            minWidth: '34px',
+            textAlign: 'right',
+            color: pct === 100 ? '#15803d' : pct > 0 ? '#0369a1' : '#64748b',
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          {pct}%
+        </span>
+        <div className="sb" style={{ flex: 1 }}>
+          {pct > 0 && (
+            <i
+              title={`Completed Stages: ${pct}%`}
+              style={{ width: `${pct}%`, background: 'var(--gr)' }}
+            />
+          )}
+          {remPct > 0 && (
+            <i
+              title={`Pending Stages: ${remPct}%`}
+              style={{ width: `${remPct}%`, background: pct > 0 ? 'var(--am)' : 'var(--sl)' }}
+            />
+          )}
+        </div>
       </div>
     );
   };
@@ -928,6 +977,53 @@ export default function Dashboard() {
     const done = isDone(status);
     const prog = isInProgress(status);
     return <span className={`c ${done ? 'g' : prog ? 'a' : ''}`}>{status}</span>;
+  };
+
+  // Helper renderer for Document/Drawing column (supports drawing numbers, document refs, or URLs)
+  const renderDocumentDrawing = (docVal?: string) => {
+    const val = (docVal || '').trim();
+    if (!val) return <span style={{ color: 'var(--mu)' }}>—</span>;
+    if (/^https?:\/\//i.test(val)) {
+      return (
+        <a
+          href={val}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={val}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '4px',
+            fontWeight: 600,
+            fontSize: '11px',
+            color: 'var(--ac)',
+          }}
+        >
+          📄 Open Doc/Drawing ↗
+        </a>
+      );
+    }
+    return (
+      <span
+        title={val}
+        style={{
+          display: 'inline-block',
+          fontSize: '11px',
+          fontWeight: 600,
+          color: '#0f172a',
+          background: '#f1f5f9',
+          border: '1px solid #cbd5e1',
+          padding: '2px 6px',
+          borderRadius: '4px',
+          maxWidth: '190px',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        📄 {val}
+      </span>
+    );
   };
 
   // Unit-wise Progress & Completion Bar Chart (Kitna Hua vs Kitna Baki)
@@ -1009,17 +1105,11 @@ export default function Dashboard() {
       return a.unit.name.localeCompare(b.unit.name);
     });
 
-    // Overview summary metrics
-    const totalUnits = treeData.length;
-    const completedUnits = treeData.filter((u) => calculateProgress(u.items) === 100).length;
-    const avgProgress = totalUnits
-      ? Math.round(treeData.reduce((acc, u) => acc + calculateProgress(u.items), 0) / totalUnits)
-      : 0;
-
-    const pillarAreaHeight = 220;
+    const pillarAreaHeight = 156;
+    const topLabelHeadroom = 18;
 
     return (
-      <div className="cd" style={{ marginBottom: '14px' }}>
+      <div className="cd" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
         {/* Card Header with Title, Layout Switcher, Metric Switcher, and Sort */}
         <div
           style={{
@@ -1027,22 +1117,23 @@ export default function Dashboard() {
             justifyContent: 'space-between',
             alignItems: 'center',
             flexWrap: 'wrap',
-            gap: '12px',
-            marginBottom: '14px',
+            gap: '8px',
+            marginBottom: '10px',
             borderBottom: '1px solid var(--bd)',
-            paddingBottom: '12px',
+            paddingBottom: '8px',
           }}
         >
           <div>
             <h3
               style={{
                 margin: 0,
-                fontSize: '13.5px',
+                fontSize: '12.5px',
                 fontWeight: 700,
                 color: 'var(--tx)',
                 display: 'flex',
                 alignItems: 'center',
-                gap: '8px',
+                flexWrap: 'wrap',
+                gap: '6px',
                 textTransform: 'none',
                 letterSpacing: '0.2px',
               }}
@@ -1050,25 +1141,22 @@ export default function Dashboard() {
               <span>📊 Unit-Wise Vertical Pillar Chart</span>
               <span
                 style={{
-                  fontSize: '11px',
+                  fontSize: '10.5px',
                   fontWeight: 600,
                   color: 'var(--ac)',
                   background: 'var(--tr)',
                   border: '1px solid var(--bd)',
-                  padding: '2px 8px',
+                  padding: '1px 7px',
                   borderRadius: '12px',
                 }}
               >
                 Completed vs Remaining
               </span>
             </h3>
-            <div style={{ fontSize: '11.5px', color: 'var(--mu)', marginTop: '3px' }}>
-              Vertical pillar / column chart showing percentage completed (% Completed) vs percentage remaining (% Remaining) for every unit.
-            </div>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-            {/* View Layout Toggle: Vertical Pillars (Default) vs Stacked Pillar vs Horizontal */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+            {/* View Layout Toggle: Vertical Pillars (Default) vs Stacked Pillar */}
             <div
               style={{
                 display: 'flex',
@@ -1084,8 +1172,8 @@ export default function Dashboard() {
                 type="button"
                 onClick={() => setUnitChartLayout('vertical-twin')}
                 style={{
-                  padding: '4px 9px',
-                  fontSize: '11.5px',
+                  padding: '3px 7px',
+                  fontSize: '11px',
                   fontWeight: unitChartLayout === 'vertical-twin' ? 700 : 500,
                   background: unitChartLayout === 'vertical-twin' ? 'var(--ac)' : 'transparent',
                   color: unitChartLayout === 'vertical-twin' ? '#fff' : 'var(--tx)',
@@ -1094,21 +1182,21 @@ export default function Dashboard() {
                   cursor: 'pointer',
                   display: 'flex',
                   alignItems: 'center',
-                  gap: '4px',
+                  gap: '3px',
                   transition: 'all 0.15s ease',
                 }}
                 title="Vertical Side-by-Side Pillars: Completed vs Remaining"
               >
                 <span>🏛️</span>
-                <span>Vertical Pillars (Completed vs Remaining)</span>
+                <span>Pillars</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setUnitChartLayout('vertical-stacked')}
                 style={{
-                  padding: '4px 9px',
-                  fontSize: '11.5px',
+                  padding: '3px 7px',
+                  fontSize: '11px',
                   fontWeight: unitChartLayout === 'vertical-stacked' ? 700 : 500,
                   background: unitChartLayout === 'vertical-stacked' ? 'var(--ac)' : 'transparent',
                   color: unitChartLayout === 'vertical-stacked' ? '#fff' : 'var(--tx)',
@@ -1117,169 +1205,101 @@ export default function Dashboard() {
                   cursor: 'pointer',
                   display: 'flex',
                   alignItems: 'center',
-                  gap: '4px',
+                  gap: '3px',
                   transition: 'all 0.15s ease',
                 }}
                 title="Vertical Stacked 100% Pillar"
               >
                 <span>📊</span>
-                <span>Stacked Pillars</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setUnitChartLayout('horizontal')}
-                style={{
-                  padding: '4px 9px',
-                  fontSize: '11.5px',
-                  fontWeight: unitChartLayout === 'horizontal' ? 700 : 500,
-                  background: unitChartLayout === 'horizontal' ? 'var(--ac)' : 'transparent',
-                  color: unitChartLayout === 'horizontal' ? '#fff' : 'var(--tx)',
-                  border: 'none',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '4px',
-                  transition: 'all 0.15s ease',
-                }}
-                title="Horizontal Bars"
-              >
-                <span>📋</span>
-                <span>Horizontal Bars</span>
+                <span>Stacked</span>
               </button>
             </div>
 
             <input
               type="text"
-              placeholder="🔍 Search unit..."
+              placeholder="🔍 Unit..."
               value={unitChartSearch}
               onChange={(e) => setUnitChartSearch(e.target.value)}
               style={{
-                padding: '4px 8px',
-                fontSize: '12px',
-                width: '130px',
+                padding: '3px 7px',
+                fontSize: '11px',
+                width: '90px',
                 borderRadius: '4px',
                 border: '1px solid var(--bd)',
               }}
             />
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px', color: 'var(--mu)' }}>
-              <span>Metric:</span>
-              <select
-                value={unitMetricType}
-                onChange={(e) => setUnitMetricType(e.target.value as any)}
-                style={{
-                  padding: '4px 8px',
-                  fontSize: '12px',
-                  borderRadius: '4px',
-                  border: '1px solid var(--bd)',
-                  background: 'var(--cd)',
-                }}
-              >
-                <option value="stage">Stage Inspection Progress %</option>
-                <option value="equip">Equipment Acceptance %</option>
-              </select>
-            </div>
+            <select
+              value={unitMetricType}
+              onChange={(e) => setUnitMetricType(e.target.value as any)}
+              title="Select metric"
+              style={{
+                padding: '3px 6px',
+                fontSize: '11px',
+                borderRadius: '4px',
+                border: '1px solid var(--bd)',
+                background: 'var(--cd)',
+              }}
+            >
+              <option value="stage">Stage %</option>
+              <option value="equip">Equip %</option>
+            </select>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px', color: 'var(--mu)' }}>
-              <span>Sort:</span>
-              <select
-                value={unitSortBy}
-                onChange={(e) => setUnitSortBy(e.target.value as any)}
-                style={{
-                  padding: '4px 8px',
-                  fontSize: '12px',
-                  borderRadius: '4px',
-                  border: '1px solid var(--bd)',
-                  background: 'var(--cd)',
-                }}
-              >
-                <option value="progress-desc">Highest % Done ↓</option>
-                <option value="progress-asc">Lowest % Done (Most Remaining) ↑</option>
-                <option value="pending-desc">Highest % Remaining ↓</option>
-                <option value="name">Unit Name (A-Z)</option>
-              </select>
-            </div>
-          </div>
-        </div>
-
-        {/* Quick Summary Pill Strip */}
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
-            gap: '8px',
-            marginBottom: '14px',
-          }}
-        >
-          <div style={{ background: 'var(--tr)', padding: '6px 10px', borderRadius: '4px', border: '1px solid var(--bd)' }}>
-            <span style={{ fontSize: '10.5px', color: 'var(--mu)', textTransform: 'uppercase', display: 'block' }}>Total Units</span>
-            <b style={{ fontSize: '15px', color: 'var(--tx)' }}>{totalUnits} Units</b>
-          </div>
-          <div style={{ background: 'var(--tr)', padding: '6px 10px', borderRadius: '4px', border: '1px solid var(--bd)' }}>
-            <span style={{ fontSize: '10.5px', color: 'var(--mu)', textTransform: 'uppercase', display: 'block' }}>Avg Unit Progress</span>
-            <b style={{ fontSize: '15px', color: 'var(--ac)' }}>{avgProgress}% Done</b>
-          </div>
-          <div style={{ background: 'var(--tr)', padding: '6px 10px', borderRadius: '4px', border: '1px solid var(--bd)' }}>
-            <span style={{ fontSize: '10.5px', color: 'var(--mu)', textTransform: 'uppercase', display: 'block' }}>100% Completed</span>
-            <b style={{ fontSize: '15px', color: 'var(--gr)' }}>{completedUnits} / {totalUnits}</b>
-          </div>
-          <div style={{ background: 'var(--tr)', padding: '6px 10px', borderRadius: '4px', border: '1px solid var(--bd)' }}>
-            <span style={{ fontSize: '10.5px', color: 'var(--mu)', textTransform: 'uppercase', display: 'block' }}>Work Pending</span>
-            <b style={{ fontSize: '15px', color: '#dc2626' }}>{totalUnits - completedUnits} Units</b>
+            <select
+              value={unitSortBy}
+              onChange={(e) => setUnitSortBy(e.target.value as any)}
+              title="Sort units"
+              style={{
+                padding: '3px 6px',
+                fontSize: '11px',
+                borderRadius: '4px',
+                border: '1px solid var(--bd)',
+                background: 'var(--cd)',
+              }}
+            >
+              <option value="progress-desc">Done ↓</option>
+              <option value="progress-asc">Done ↑</option>
+              <option value="pending-desc">Pending ↓</option>
+              <option value="name">A-Z</option>
+            </select>
           </div>
         </div>
 
         {/* MAIN CHART BODY */}
         {unitStats.length === 0 ? (
-          <div style={{ textAlign: 'center', padding: '30px', color: 'var(--mu)', fontSize: '13px' }}>
+          <div style={{ textAlign: 'center', padding: '30px', color: 'var(--mu)', fontSize: '13px', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             No matching units found.
           </div>
-        ) : unitChartLayout === 'vertical-twin' || unitChartLayout === 'vertical-stacked' ? (
+        ) : (
           /* VERTICAL PILLAR / COLUMN CHART */
           <div
             style={{
-              background: 'var(--cd)',
+              background: 'linear-gradient(180deg, #f8fafc 0%, #ffffff 100%)',
               border: '1px solid var(--bd)',
               borderRadius: '8px',
-              padding: '16px 12px 14px 10px',
+              padding: '10px 10px 10px 6px',
               position: 'relative',
+              flex: 1,
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
             }}
           >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                marginBottom: '12px',
-                fontSize: '11px',
-                color: 'var(--mu)',
-                paddingLeft: '44px',
-              }}
-            >
-              <span>
-                💡 <b>Pillar Chart:</b> Vertical height directly represents percentage (0% to 100%). Hover for complete details or click unit name to open.
-              </span>
-              <span>
-                Showing <b>{unitStats.length}</b> units
-              </span>
-            </div>
-
-            {/* Scrollable Container with Y-Axis and Columns */}
+            {/* Container with Y-Axis and Columns */}
             <div
               style={{
                 display: 'flex',
                 overflowX: 'auto',
-                paddingBottom: '10px',
+                paddingBottom: '4px',
                 position: 'relative',
               }}
             >
               {/* Left Y-Axis */}
               <div
                 style={{
-                  width: '42px',
-                  minWidth: '42px',
+                  width: '36px',
+                  minWidth: '36px',
+                  marginTop: `${topLabelHeadroom}px`,
                   height: `${pillarAreaHeight}px`,
                   display: 'flex',
                   flexDirection: 'column',
@@ -1287,10 +1307,11 @@ export default function Dashboard() {
                   alignItems: 'flex-end',
                   paddingRight: '6px',
                   borderRight: '2px solid var(--bd)',
-                  fontSize: '10.5px',
+                  fontSize: '10px',
                   fontWeight: 600,
                   color: 'var(--mu)',
                   userSelect: 'none',
+                  lineHeight: 1,
                 }}
               >
                 <span>100%</span>
@@ -1305,14 +1326,14 @@ export default function Dashboard() {
                 style={{
                   position: 'relative',
                   flex: 1,
-                  minWidth: `${Math.max(600, unitStats.length * (unitChartLayout === 'vertical-twin' ? 84 : 68))}px`,
+                  minWidth: `${Math.max(420, unitStats.length * (unitChartLayout === 'vertical-twin' ? 54 : 46))}px`,
                 }}
               >
                 {/* Horizontal Dashed Grid Lines aligned with Y-Axis marks */}
                 <div
                   style={{
                     position: 'absolute',
-                    top: 0,
+                    top: `${topLabelHeadroom}px`,
                     left: 0,
                     right: 0,
                     height: '1px',
@@ -1323,7 +1344,7 @@ export default function Dashboard() {
                 <div
                   style={{
                     position: 'absolute',
-                    top: `${pillarAreaHeight * 0.25}px`,
+                    top: `${topLabelHeadroom + pillarAreaHeight * 0.25}px`,
                     left: 0,
                     right: 0,
                     height: '1px',
@@ -1334,7 +1355,7 @@ export default function Dashboard() {
                 <div
                   style={{
                     position: 'absolute',
-                    top: `${pillarAreaHeight * 0.5}px`,
+                    top: `${topLabelHeadroom + pillarAreaHeight * 0.5}px`,
                     left: 0,
                     right: 0,
                     height: '1px',
@@ -1345,7 +1366,7 @@ export default function Dashboard() {
                 <div
                   style={{
                     position: 'absolute',
-                    top: `${pillarAreaHeight * 0.75}px`,
+                    top: `${topLabelHeadroom + pillarAreaHeight * 0.75}px`,
                     left: 0,
                     right: 0,
                     height: '1px',
@@ -1356,7 +1377,7 @@ export default function Dashboard() {
                 <div
                   style={{
                     position: 'absolute',
-                    top: `${pillarAreaHeight}px`,
+                    top: `${topLabelHeadroom + pillarAreaHeight}px`,
                     left: 0,
                     right: 0,
                     height: '2px',
@@ -1370,17 +1391,18 @@ export default function Dashboard() {
                   style={{
                     display: 'flex',
                     alignItems: 'flex-end',
-                    height: `${pillarAreaHeight}px`,
-                    padding: '0 12px',
-                    gap: unitChartLayout === 'vertical-twin' ? '14px' : '12px',
+                    height: `${topLabelHeadroom + pillarAreaHeight}px`,
+                    padding: '0 6px',
+                    gap: '6px',
                     position: 'relative',
                     zIndex: 2,
                   }}
                 >
-                  {unitStats.map((item) => {
+                  {unitStats.map((item, idx) => {
                     const doneHeight = Math.max(4, Math.round((item.donePct / 100) * pillarAreaHeight));
                     const bakiHeight = Math.max(4, Math.round((item.bakiPct / 100) * pillarAreaHeight));
                     const isHovered = hoveredUnitPillar === item.unit.id;
+                    const showTooltipOnLeft = unitStats.length > 2 && idx >= Math.ceil(unitStats.length / 2);
 
                     return (
                       <div
@@ -1388,17 +1410,20 @@ export default function Dashboard() {
                         onMouseEnter={() => setHoveredUnitPillar(item.unit.id)}
                         onMouseLeave={() => setHoveredUnitPillar(null)}
                         style={{
+                          flex: '1 1 0px',
+                          maxWidth: '88px',
+                          minWidth: unitChartLayout === 'vertical-twin' ? '48px' : '40px',
                           display: 'flex',
                           flexDirection: 'column',
                           alignItems: 'center',
                           justifyContent: 'flex-end',
                           height: '100%',
-                          minWidth: unitChartLayout === 'vertical-twin' ? '72px' : '58px',
                           position: 'relative',
+                          zIndex: isHovered ? 60 : 1,
                           cursor: 'pointer',
-                          background: isHovered ? 'rgba(20, 89, 143, 0.05)' : 'transparent',
+                          background: isHovered ? 'rgba(20, 89, 143, 0.08)' : 'transparent',
                           borderRadius: '6px 6px 0 0',
-                          padding: '0 4px',
+                          padding: '0 2px',
                           transition: 'background 0.15s ease',
                         }}
                         onClick={() => {
@@ -1407,53 +1432,70 @@ export default function Dashboard() {
                           }
                         }}
                       >
-                        {/* Interactive Hover Tooltip Popover */}
+                        {/* Interactive Hover Tooltip Popover - Positioned cleanly inside chart viewport */}
                         {isHovered && (
                           <div
                             style={{
                               position: 'absolute',
-                              bottom: `${Math.max(doneHeight, bakiHeight) + 12}px`,
-                              left: '50%',
-                              transform: 'translateX(-50%)',
+                              top: '14px',
+                              ...(showTooltipOnLeft
+                                ? { right: 'calc(100% + 6px)', left: 'auto' }
+                                : { left: 'calc(100% + 6px)', right: 'auto' }),
                               background: '#0f172a',
                               color: '#fff',
-                              borderRadius: '6px',
-                              padding: '8px 12px',
+                              borderRadius: '7px',
+                              padding: '8px 11px',
                               fontSize: '11px',
-                              lineHeight: '1.4',
-                              boxShadow: '0 10px 25px -5px rgba(0,0,0,0.4)',
-                              zIndex: 100,
+                              lineHeight: '1.45',
+                              boxShadow: '0 10px 25px -4px rgba(15, 23, 42, 0.55), 0 4px 10px -2px rgba(15, 23, 42, 0.3)',
+                              zIndex: 200,
                               whiteSpace: 'nowrap',
                               pointerEvents: 'none',
-                              border: '1px solid rgba(255,255,255,0.1)',
+                              border: '1px solid rgba(56, 189, 248, 0.35)',
                             }}
                           >
-                            <div style={{ fontWeight: 700, fontSize: '12px', marginBottom: '4px', color: '#38bdf8' }}>
+                            <div
+                              style={{
+                                fontWeight: 700,
+                                fontSize: '12px',
+                                marginBottom: '4px',
+                                color: '#38bdf8',
+                                borderBottom: '1px solid rgba(255,255,255,0.12)',
+                                paddingBottom: '3px',
+                              }}
+                            >
                               {item.unit.name}
                             </div>
-                            <div style={{ display: 'flex', gap: '8px', marginBottom: '2px' }}>
-                              <span style={{ color: '#4ade80' }}>● % Completed:</span>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', marginBottom: '2px' }}>
+                              <span style={{ color: '#4ade80' }}>● Completed:</span>
                               <b>{item.donePct}% ({item.doneCount}/{item.totalCount})</b>
                             </div>
                             {item.inProgPct > 0 && (
-                              <div style={{ display: 'flex', gap: '8px', marginBottom: '2px' }}>
-                                <span style={{ color: '#facc15' }}>● % In Progress:</span>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', marginBottom: '2px' }}>
+                                <span style={{ color: '#facc15' }}>● In Progress:</span>
                                 <b>{item.inProgPct}% ({item.inProgCount})</b>
                               </div>
                             )}
-                            <div style={{ display: 'flex', gap: '8px', marginBottom: '4px' }}>
-                              <span style={{ color: '#f87171' }}>● % Remaining:</span>
-                              <b>{item.bakiPct}% ({item.bakiCount} remaining)</b>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', marginBottom: '4px' }}>
+                              <span style={{ color: '#f87171' }}>● Remaining:</span>
+                              <b>{item.bakiPct}% ({item.bakiCount})</b>
                             </div>
-                            <div style={{ fontSize: '10px', color: '#94a3b8', borderTop: '1px solid rgba(255,255,255,0.15)', paddingTop: '3px' }}>
-                              Equipment: {item.completedEq} of {item.totalEq} completed · Click to open
+                            <div
+                              style={{
+                                fontSize: '10px',
+                                color: '#cbd5e1',
+                                borderTop: '1px solid rgba(255,255,255,0.14)',
+                                paddingTop: '3px',
+                              }}
+                            >
+                              Equipment: <b>{item.completedEq}/{item.totalEq}</b> done · Click to open
                             </div>
                           </div>
                         )}
 
                         {unitChartLayout === 'vertical-twin' ? (
                           /* TWIN VERTICAL PILLARS (COMPLETED vs REMAINING) */
-                          <div style={{ display: 'flex', alignItems: 'flex-end', gap: '4px', height: '100%' }}>
+                          <div style={{ display: 'flex', alignItems: 'flex-end', gap: '3px', height: '100%' }}>
                             {/* 1. Completed Pillar (Green) */}
                             <div
                               style={{
@@ -1466,9 +1508,9 @@ export default function Dashboard() {
                             >
                               <span
                                 style={{
-                                  fontSize: '10.5px',
+                                  fontSize: '9.5px',
                                   fontWeight: 800,
-                                  color: 'var(--gr)',
+                                  color: item.donePct > 0 ? 'var(--gr)' : 'var(--mu)',
                                   marginBottom: '3px',
                                   lineHeight: 1,
                                 }}
@@ -1477,38 +1519,22 @@ export default function Dashboard() {
                               </span>
                               <div
                                 style={{
-                                  width: '26px',
+                                  width: '18px',
                                   height: `${doneHeight}px`,
-                                  background: 'linear-gradient(180deg, #22c55e 0%, #15803d 100%)',
-                                  borderRadius: '4px 4px 0 0',
-                                  boxShadow: isHovered
-                                    ? '0 0 10px rgba(34, 197, 94, 0.6)'
-                                    : '0 2px 5px rgba(21, 128, 61, 0.25)',
-                                  display: 'flex',
-                                  flexDirection: 'column',
-                                  alignItems: 'center',
-                                  justifyContent: 'flex-end',
-                                  paddingBottom: '3px',
+                                  background:
+                                    item.donePct === 0
+                                      ? '#cbd5e1'
+                                      : 'linear-gradient(180deg, #22c55e 0%, #15803d 100%)',
+                                  borderRadius: '3px 3px 0 0',
+                                  boxShadow:
+                                    item.donePct > 0 && isHovered
+                                      ? '0 0 8px rgba(34, 197, 94, 0.55)'
+                                      : item.donePct > 0
+                                      ? '0 1px 3px rgba(21, 128, 61, 0.25)'
+                                      : 'none',
                                   transition: 'height 0.3s ease, box-shadow 0.15s ease',
                                 }}
-                              >
-                                {doneHeight >= 32 && (
-                                  <span
-                                    style={{
-                                      fontSize: '9px',
-                                      fontWeight: 800,
-                                      color: '#ffffff',
-                                      textShadow: '0 1px 2px rgba(0,0,0,0.5)',
-                                      writingMode: 'horizontal-tb',
-                                    }}
-                                  >
-                                    DONE
-                                  </span>
-                                )}
-                              </div>
-                              <span style={{ fontSize: '9.5px', fontWeight: 600, color: 'var(--gr)', marginTop: '2px' }}>
-                                Done
-                              </span>
+                              />
                             </div>
 
                             {/* 2. Remaining Pillar (Red / Coral) */}
@@ -1523,7 +1549,7 @@ export default function Dashboard() {
                             >
                               <span
                                 style={{
-                                  fontSize: '10.5px',
+                                  fontSize: '9.5px',
                                   fontWeight: 800,
                                   color: item.bakiPct === 0 ? 'var(--mu)' : '#dc2626',
                                   marginBottom: '3px',
@@ -1534,50 +1560,22 @@ export default function Dashboard() {
                               </span>
                               <div
                                 style={{
-                                  width: '26px',
+                                  width: '18px',
                                   height: `${bakiHeight}px`,
                                   background:
                                     item.bakiPct === 0
                                       ? '#cbd5e1'
                                       : 'linear-gradient(180deg, #f87171 0%, #dc2626 100%)',
-                                  borderRadius: '4px 4px 0 0',
+                                  borderRadius: '3px 3px 0 0',
                                   boxShadow:
                                     item.bakiPct > 0 && isHovered
-                                      ? '0 0 10px rgba(220, 38, 38, 0.6)'
+                                      ? '0 0 8px rgba(220, 38, 38, 0.55)'
                                       : item.bakiPct > 0
-                                      ? '0 2px 5px rgba(220, 38, 38, 0.25)'
+                                      ? '0 1px 3px rgba(220, 38, 38, 0.25)'
                                       : 'none',
-                                  display: 'flex',
-                                  flexDirection: 'column',
-                                  alignItems: 'center',
-                                  justifyContent: 'flex-end',
-                                  paddingBottom: '3px',
                                   transition: 'height 0.3s ease, box-shadow 0.15s ease',
                                 }}
-                              >
-                                {bakiHeight >= 32 && item.bakiPct > 0 && (
-                                  <span
-                                    style={{
-                                      fontSize: '9px',
-                                      fontWeight: 800,
-                                      color: '#ffffff',
-                                      textShadow: '0 1px 2px rgba(0,0,0,0.5)',
-                                    }}
-                                  >
-                                    REMAIN
-                                  </span>
-                                )}
-                              </div>
-                              <span
-                                style={{
-                                  fontSize: '9.5px',
-                                  fontWeight: 600,
-                                  color: item.bakiPct === 0 ? 'var(--mu)' : '#dc2626',
-                                  marginTop: '2px',
-                                }}
-                              >
-                                Pending
-                              </span>
+                              />
                             </div>
                           </div>
                         ) : (
@@ -1593,7 +1591,7 @@ export default function Dashboard() {
                           >
                             <span
                               style={{
-                                fontSize: '10.5px',
+                                fontSize: '9.5px',
                                 fontWeight: 800,
                                 color: 'var(--tx)',
                                 marginBottom: '3px',
@@ -1604,15 +1602,15 @@ export default function Dashboard() {
                             </span>
                             <div
                               style={{
-                                width: '36px',
+                                width: '28px',
                                 height: `${pillarAreaHeight}px`,
                                 background: 'var(--slb)',
-                                borderRadius: '5px 5px 0 0',
+                                borderRadius: '4px 4px 0 0',
                                 overflow: 'hidden',
                                 display: 'flex',
                                 flexDirection: 'column-reverse',
                                 border: '1px solid var(--bd)',
-                                boxShadow: isHovered ? '0 0 10px rgba(20, 89, 143, 0.3)' : 'none',
+                                boxShadow: isHovered ? '0 0 8px rgba(20, 89, 143, 0.3)' : 'none',
                                 transition: 'box-shadow 0.15s ease',
                               }}
                             >
@@ -1622,16 +1620,15 @@ export default function Dashboard() {
                                   height: `${(item.donePct / 100) * pillarAreaHeight}px`,
                                   background: 'var(--gr)',
                                   color: '#fff',
-                                  fontSize: '9.5px',
+                                  fontSize: '9px',
                                   fontWeight: 700,
                                   display: 'flex',
                                   alignItems: 'center',
                                   justifyContent: 'center',
                                   overflow: 'hidden',
                                 }}
-                                title={`${item.donePct}% Done`}
                               >
-                                {item.donePct >= 14 ? `${item.donePct}%` : ''}
+                                {item.donePct >= 16 ? `${item.donePct}%` : ''}
                               </div>
                               {/* Middle In Progress slice */}
                               {item.inProgPct > 0 && (
@@ -1640,16 +1637,15 @@ export default function Dashboard() {
                                     height: `${(item.inProgPct / 100) * pillarAreaHeight}px`,
                                     background: 'var(--am)',
                                     color: '#fff',
-                                    fontSize: '9.5px',
+                                    fontSize: '9px',
                                     fontWeight: 700,
                                     display: 'flex',
                                     alignItems: 'center',
                                     justifyContent: 'center',
                                     overflow: 'hidden',
                                   }}
-                                  title={`${item.inProgPct}% In Progress`}
                                 >
-                                  {item.inProgPct >= 14 ? `${item.inProgPct}%` : ''}
+                                  {item.inProgPct >= 16 ? `${item.inProgPct}%` : ''}
                                 </div>
                               )}
                               {/* Top Remaining slice */}
@@ -1659,22 +1655,18 @@ export default function Dashboard() {
                                     height: `${(item.notStartedPct / 100) * pillarAreaHeight}px`,
                                     background: '#cbd5e1',
                                     color: '#334155',
-                                    fontSize: '9.5px',
+                                    fontSize: '9px',
                                     fontWeight: 700,
                                     display: 'flex',
                                     alignItems: 'center',
                                     justifyContent: 'center',
                                     overflow: 'hidden',
                                   }}
-                                  title={`${item.notStartedPct}% Remaining`}
                                 >
                                   {item.notStartedPct >= 18 ? `${item.notStartedPct}%` : ''}
                                 </div>
                               )}
                             </div>
-                            <span style={{ fontSize: '9.5px', color: 'var(--mu)', marginTop: '2px' }}>
-                              {item.bakiPct}% Remaining
-                            </span>
                           </div>
                         )}
                       </div>
@@ -1686,15 +1678,17 @@ export default function Dashboard() {
                 <div
                   style={{
                     display: 'flex',
-                    padding: '8px 12px 0 12px',
-                    gap: unitChartLayout === 'vertical-twin' ? '14px' : '12px',
+                    padding: '6px 6px 0 6px',
+                    gap: '6px',
                   }}
                 >
                   {unitStats.map((item) => (
                     <div
                       key={item.unit.id}
                       style={{
-                        minWidth: unitChartLayout === 'vertical-twin' ? '72px' : '58px',
+                        flex: '1 1 0px',
+                        maxWidth: '88px',
+                        minWidth: unitChartLayout === 'vertical-twin' ? '48px' : '40px',
                         display: 'flex',
                         flexDirection: 'column',
                         alignItems: 'center',
@@ -1704,11 +1698,11 @@ export default function Dashboard() {
                       <a
                         href={`#${item.unit.id}`}
                         style={{
-                          fontSize: '11px',
+                          fontSize: '10.5px',
                           fontWeight: 700,
                           color: 'var(--ac)',
                           textDecoration: 'none',
-                          maxWidth: unitChartLayout === 'vertical-twin' ? '72px' : '58px',
+                          width: '100%',
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap',
@@ -1721,13 +1715,13 @@ export default function Dashboard() {
                       </a>
                       <span
                         style={{
-                          fontSize: '9.5px',
+                          fontSize: '9px',
                           color: 'var(--mu)',
                           background: 'var(--tr)',
                           border: '1px solid var(--bd)',
-                          padding: '1px 4px',
+                          padding: '0px 4px',
                           borderRadius: '3px',
-                          marginTop: '3px',
+                          marginTop: '2px',
                           whiteSpace: 'nowrap',
                         }}
                       >
@@ -1739,199 +1733,10 @@ export default function Dashboard() {
               </div>
             </div>
           </div>
-        ) : (
-          /* HORIZONTAL BARS VIEW */
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            {unitStats.map((item) => (
-              <div
-                key={item.unit.id}
-                style={{
-                  background: 'var(--tr)',
-                  border: '1px solid var(--bd)',
-                  borderRadius: '6px',
-                  padding: '9px 12px',
-                }}
-              >
-                {/* Header row: Unit name, Systems, and Badges for % Done vs % Baki */}
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    flexWrap: 'wrap',
-                    gap: '6px',
-                    marginBottom: '6px',
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <a
-                      href={`#${item.unit.id}`}
-                      style={{ fontWeight: 700, fontSize: '13px', color: 'var(--ac)' }}
-                      title={`Click to drilldown to ${item.unit.name}`}
-                    >
-                      {item.unit.name}
-                    </a>
-                    <span
-                      style={{
-                        fontSize: '11px',
-                        color: 'var(--mu)',
-                        background: 'var(--cd)',
-                        padding: '1px 6px',
-                        borderRadius: '3px',
-                        border: '1px solid var(--bd)',
-                      }}
-                    >
-                      {item.totalEq} equip. · {item.unit.systems.length} systems
-                    </span>
-                  </div>
-
-                  {/* Highlights of Percentage Completed & Percentage Remaining */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11.5px' }}>
-                    <span
-                      style={{
-                        color: 'var(--gr)',
-                        background: 'var(--grb)',
-                        padding: '2px 7px',
-                        borderRadius: '4px',
-                        fontWeight: 700,
-                      }}
-                      title={`${item.doneCount} of ${item.totalCount} completed`}
-                    >
-                      ✓ {item.donePct}% Completed
-                    </span>
-
-                    {item.inProgPct > 0 && (
-                      <span
-                        style={{
-                          color: 'var(--am)',
-                          background: 'var(--amb)',
-                          padding: '2px 7px',
-                          borderRadius: '4px',
-                          fontWeight: 700,
-                        }}
-                        title={`${item.inProgCount} of ${item.totalCount} in progress`}
-                      >
-                        ⏳ {item.inProgPct}% In Progress
-                      </span>
-                    )}
-
-                    <span
-                      style={{
-                        color: item.bakiPct === 0 ? 'var(--gr)' : '#b91c1c',
-                        background: item.bakiPct === 0 ? 'var(--grb)' : '#fee2e2',
-                        padding: '2px 7px',
-                        borderRadius: '4px',
-                        fontWeight: 700,
-                      }}
-                      title={`${item.bakiCount} remaining / pending`}
-                    >
-                      {item.bakiPct === 0 ? '🎉 0% Remaining (All Done)' : `✕ ${item.bakiPct}% Remaining (Pending)`}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Visual Stacked Progress Bar */}
-                <div
-                  style={{
-                    height: '18px',
-                    background: 'var(--slb)',
-                    borderRadius: '4px',
-                    overflow: 'hidden',
-                    display: 'flex',
-                    border: '1px solid rgba(0,0,0,0.06)',
-                  }}
-                  title={`${item.unit.name}: ${item.donePct}% Completed, ${item.inProgPct}% In Progress, ${item.bakiPct}% Remaining (${item.doneCount}/${item.totalCount})`}
-                >
-                  {/* Done / Completed Bar */}
-                  {item.donePct > 0 && (
-                    <div
-                      style={{
-                        width: `${item.donePct}%`,
-                        background: 'var(--gr)',
-                        color: '#fff',
-                        fontSize: '10.5px',
-                        fontWeight: 700,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        transition: 'width 0.3s ease',
-                      }}
-                    >
-                      {item.donePct >= 12 ? `${item.donePct}%` : ''}
-                    </div>
-                  )}
-
-                  {/* In Progress Bar */}
-                  {item.inProgPct > 0 && (
-                    <div
-                      style={{
-                        width: `${item.inProgPct}%`,
-                        background: 'var(--am)',
-                        color: '#fff',
-                        fontSize: '10.5px',
-                        fontWeight: 700,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        transition: 'width 0.3s ease',
-                      }}
-                    >
-                      {item.inProgPct >= 12 ? `${item.inProgPct}%` : ''}
-                    </div>
-                  )}
-
-                  {/* Remaining Bar */}
-                  {item.notStartedPct > 0 && (
-                    <div
-                      style={{
-                        width: `${item.notStartedPct}%`,
-                        background: '#cbd5e1',
-                        color: '#334155',
-                        fontSize: '10.5px',
-                        fontWeight: 700,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        transition: 'width 0.3s ease',
-                      }}
-                    >
-                      {item.notStartedPct >= 15 ? `${item.notStartedPct}% Remaining` : ''}
-                    </div>
-                  )}
-                </div>
-
-                {/* Sub-detail counts */}
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    marginTop: '4px',
-                    fontSize: '11px',
-                    color: 'var(--mu)',
-                  }}
-                >
-                  <span>
-                    Status: <b>{item.completedEq}</b> completed · <b>{item.totalEq - item.completedEq}</b> remaining of{' '}
-                    <b>{item.totalEq}</b> total equipment
-                  </span>
-                  <span>
-                    Inspection Stages: <b>{item.doneCount}</b>/{item.totalCount} ({item.donePct}%) done
-                  </span>
-                </div>
-              </div>
-            ))}
-          </div>
         )}
 
         {/* Legend */}
-        <div className="lg" style={{ marginTop: '14px', paddingTop: '10px', borderTop: '1px solid var(--bd)' }}>
+        <div className="lg" style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid var(--bd)' }}>
           <span>
             <i style={{ background: 'var(--gr)' }}></i><b>% Completed</b> (Work Done)
           </span>
@@ -1979,82 +1784,106 @@ export default function Dashboard() {
 
         {/* Compact Search Icon -> Opens Compact Search Input on Click */}
         <div className="gs" ref={searchContainerRef}>
-          {!searchBoxOpen ? (
-            <button
-              type="button"
-              id="gs-btn"
-              title="Search tag, equipment, system, unit"
-              aria-label="Open search"
-              onClick={() => {
-                setSearchBoxOpen(true);
-                setTimeout(() => searchInputRef.current?.focus(), 20);
-              }}
+          <button
+            type="button"
+            id="gs-btn"
+            title="Search tag, equipment, system, unit"
+            aria-label="Open search"
+            onClick={(e) => {
+              e.stopPropagation();
+              setSearchBoxOpen(true);
+              setShowGlobalResults(true);
+              setTimeout(() => searchInputRef.current?.focus(), 20);
+            }}
+            style={{
+              padding: '6px 9px',
+              height: '30px',
+              display: searchBoxOpen ? 'none' : 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              borderRadius: '5px',
+            }}
+          >
+            <Search size={15} />
+          </button>
+
+          <div
+            style={{
+              position: 'relative',
+              display: searchBoxOpen ? 'flex' : 'none',
+              alignItems: 'center',
+            }}
+          >
+            <Search
+              size={13}
               style={{
-                padding: '6px 9px',
-                height: '30px',
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                borderRadius: '5px',
+                position: 'absolute',
+                left: '9px',
+                color: 'rgba(255, 255, 255, 0.7)',
+                pointerEvents: 'none',
               }}
-            >
-              <Search size={15} />
-            </button>
-          ) : (
-            <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
-              <Search
-                size={13}
-                style={{
-                  position: 'absolute',
-                  left: '9px',
-                  color: 'rgba(255, 255, 255, 0.7)',
-                  pointerEvents: 'none',
-                }}
-              />
-              <input
-                ref={searchInputRef}
-                id="gs"
-                placeholder="Search tag, unit…"
-                value={globalSearch}
-                onChange={(e) => {
-                  setGlobalSearch(e.target.value);
-                  setShowGlobalResults(true);
-                }}
-                onFocus={() => setShowGlobalResults(true)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Escape') {
-                    setGlobalSearch('');
-                    setShowGlobalResults(false);
-                    setSearchBoxOpen(false);
-                  }
-                }}
-                autoComplete="off"
-              />
-              <button
-                type="button"
-                title="Close search"
-                aria-label="Close search"
-                onClick={() => {
+            />
+            <input
+              ref={searchInputRef}
+              id="gs"
+              placeholder="Search tag, unit…"
+              value={globalSearch}
+              onChange={(e) => {
+                setGlobalSearch(e.target.value);
+                setShowGlobalResults(true);
+              }}
+              onFocus={() => setShowGlobalResults(true)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
                   setGlobalSearch('');
                   setShowGlobalResults(false);
                   setSearchBoxOpen(false);
-                }}
-                style={{
-                  position: 'absolute',
-                  right: '4px',
-                  border: 'none',
-                  background: 'transparent',
-                  padding: '2px 4px',
-                  color: 'rgba(255, 255, 255, 0.75)',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                }}
-              >
-                <X size={13} />
-              </button>
-            </div>
-          )}
+                } else if (e.key === 'Enter' && globalSearchResults) {
+                  if (globalSearchResults.matchedEquipment.length > 0) {
+                    window.location.hash = `#eq-${encodeURIComponent(globalSearchResults.matchedEquipment[0].EquipmentTagNo)}`;
+                    setShowGlobalResults(false);
+                    setGlobalSearch('');
+                    setSearchBoxOpen(false);
+                  } else if (globalSearchResults.matchedUnits.length > 0) {
+                    window.location.hash = `#${globalSearchResults.matchedUnits[0].id}`;
+                    setShowGlobalResults(false);
+                    setGlobalSearch('');
+                    setSearchBoxOpen(false);
+                  } else if (globalSearchResults.matchedSystems.length > 0) {
+                    window.location.hash = `#${globalSearchResults.matchedSystems[0].s.id}`;
+                    setShowGlobalResults(false);
+                    setGlobalSearch('');
+                    setSearchBoxOpen(false);
+                  }
+                }
+              }}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              title="Close search"
+              aria-label="Close search"
+              onClick={(e) => {
+                e.stopPropagation();
+                setGlobalSearch('');
+                setShowGlobalResults(false);
+                setSearchBoxOpen(false);
+              }}
+              style={{
+                position: 'absolute',
+                right: '4px',
+                border: 'none',
+                background: 'transparent',
+                padding: '2px 4px',
+                color: 'rgba(255, 255, 255, 0.75)',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <X size={13} />
+            </button>
+          </div>
 
           {searchBoxOpen && showGlobalResults && globalSearchResults && (
             <div id="gr" className="show">
@@ -2186,435 +2015,382 @@ export default function Dashboard() {
           </button>
         </div>
 
-        {/* Segmented Sidebar Tabs: Units, Tools, and Admin */}
-        <div
-          style={{
-            display: 'flex',
-            borderBottom: '1px solid var(--bd)',
-            background: 'var(--tr)',
-            padding: '6px 8px',
-            gap: '4px',
-          }}
-        >
-          <button
-            type="button"
-            onClick={() => setTreeTab('hierarchy')}
+        {/* Vertical Sidebar Navigation: Tasks, 7 Units, 8 UTILITY Sub-Units & Equipment */}
+        <div style={{ flex: 1, overflowY: 'auto', paddingBottom: '16px' }}>
+          <div style={{ padding: '10px 12px 8px' }}>
+            <input
+              id="tq"
+              placeholder="🔍 Search unit, sub-unit, equipment…"
+              value={treeFilter}
+              onChange={(e) => setTreeFilter(e.target.value)}
+              style={{ width: '100%', boxSizing: 'border-box' }}
+            />
+          </div>
+
+          <div
             style={{
-              flex: 1,
-              padding: '6px 6px',
-              fontSize: '11px',
-              fontWeight: treeTab === 'hierarchy' ? 700 : 500,
-              background: treeTab === 'hierarchy' ? 'var(--cd)' : 'transparent',
-              color: treeTab === 'hierarchy' ? 'var(--ac)' : 'var(--tx)',
-              border: treeTab === 'hierarchy' ? '1px solid var(--bd)' : '1px solid transparent',
-              borderRadius: '5px',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: '4px',
+              padding: '4px 14px 4px',
+              fontSize: '10px',
+              fontWeight: 700,
+              textTransform: 'uppercase',
+              letterSpacing: '0.6px',
+              color: 'var(--mu)',
             }}
           >
-            <span>📁</span>
-            <span>Units</span>
-          </button>
+            Workspace &amp; Tasks
+          </div>
 
-          <button
-            type="button"
-            onClick={() => setTreeTab('tools')}
-            style={{
-              flex: 1,
-              padding: '6px 6px',
-              fontSize: '11px',
-              fontWeight: treeTab === 'tools' ? 700 : 500,
-              background: treeTab === 'tools' ? 'var(--cd)' : 'transparent',
-              color: treeTab === 'tools' ? 'var(--ac)' : 'var(--tx)',
-              border: treeTab === 'tools' ? '1px solid var(--bd)' : '1px solid transparent',
-              borderRadius: '5px',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: '4px',
-            }}
+          {/* 1. Project Overview (All Units) */}
+          <div
+            className={`tn ${viewLevel === 'p' ? 'on' : ''}`}
+            onClick={goToHome}
           >
-            <span>🛠️</span>
-            <span>Tools</span>
-          </button>
-
-          {isAdmin && (
-            <button
-              type="button"
-              onClick={() => setTreeTab('admin')}
-              style={{
-                flex: 1,
-                padding: '6px 6px',
-                fontSize: '11px',
-                fontWeight: treeTab === 'admin' ? 700 : 500,
-                background: treeTab === 'admin' ? 'var(--cd)' : 'transparent',
-                color: treeTab === 'admin' ? 'var(--ac)' : 'var(--tx)',
-                border: treeTab === 'admin' ? '1px solid var(--bd)' : '1px solid transparent',
-                borderRadius: '5px',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '4px',
+            <span className="tg">▣</span>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                goToHome();
               }}
             >
-              <span>⚙️</span>
-              <span>Admin</span>
-            </button>
+              NREP Project (All 7 Units)
+            </a>
+            {renderPill(equipment)}
+          </div>
+
+          {/* 2. Excel & Data Tools (Opens in Right Pane) */}
+          <div
+            className={`tn ${viewLevel === 'tools' ? 'on' : ''}`}
+            onClick={() => {
+              window.location.hash = 'tools';
+              setViewLevel('tools');
+              setTreeOpen(false);
+            }}
+          >
+            <span className="tg">🛠️</span>
+            <a
+              href="#tools"
+              onClick={(e) => {
+                e.preventDefault();
+                window.location.hash = 'tools';
+                setViewLevel('tools');
+                setTreeOpen(false);
+              }}
+            >
+              Excel &amp; Data Tools
+            </a>
+            <span className="pill p-na">Import / Export</span>
+          </div>
+
+          {/* 3. Admin & Live Database Console (Opens in Right Pane) */}
+          {(isAdmin || isEditor) && (
+            <div
+              className={`tn ${viewLevel === 'admin' ? 'on' : ''}`}
+              onClick={() => {
+                window.location.hash = 'admin';
+                setViewLevel('admin');
+                setTreeOpen(false);
+              }}
+            >
+              <span className="tg">⚙️</span>
+              <a
+                href="#admin"
+                onClick={(e) => {
+                  e.preventDefault();
+                  window.location.hash = 'admin';
+                  setViewLevel('admin');
+                  setTreeOpen(false);
+                }}
+              >
+                Admin &amp; Live Database
+              </a>
+              <span className="pill p-ip">Edit / Delete</span>
+            </div>
           )}
-        </div>
 
-        {/* TAB 1: UNITS & SYSTEMS HIERARCHY */}
-        {treeTab === 'hierarchy' && (
-          <div style={{ flex: 1, overflowY: 'auto', paddingBottom: '16px' }}>
-            <div style={{ padding: '10px 12px 6px' }}>
-              <input
-                id="tq"
-                placeholder="🔍 Search unit / system…"
-                value={treeFilter}
-                onChange={(e) => setTreeFilter(e.target.value)}
-                style={{ width: '100%', boxSizing: 'border-box' }}
-              />
-            </div>
-
-            {/* Project root */}
-            <div
-              className={`tn ${viewLevel === 'p' ? 'on' : ''}`}
-              onClick={goToHome}
-            >
-              <span className="tg"></span>
-              <a href="#" onClick={(e) => { e.preventDefault(); goToHome(); }}>▣ NREP Project (All Units)</a>
-              {renderPill(equipment)}
-            </div>
-
-            {/* Units and systems tree */}
-            {treeData.map((u) => {
-              const tf = treeFilter.toLowerCase();
-              const unitMatches = u.name.toLowerCase().includes(tf);
-              const matchedSystems = u.systems.filter(
-                (s) => unitMatches || s.name.toLowerCase().includes(tf)
-              );
-
-              if (tf && !unitMatches && !matchedSystems.length) return null;
-
-              const isExpanded = tf ? true : expandedUnits.has(u.id);
-
-              return (
-                <React.Fragment key={u.id}>
-                  <div
-                    className={`tn l1 ${viewLevel === 'u' && selectedUnitName === u.name ? 'on' : ''}`}
-                  >
-                    <button
-                      className="tg"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setExpandedUnits((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(u.id)) next.delete(u.id);
-                          else next.add(u.id);
-                          return next;
-                        });
-                      }}
-                    >
-                      {isExpanded ? '▾' : '▸'}
-                    </button>
-                    <a
-                      href={`#${u.id}`}
-                      onClick={() => setTreeOpen(false)}
-                    >
-                      {u.name}
-                    </a>
-                    {renderPill(u.items)}
-                  </div>
-
-                  {isExpanded &&
-                    (tf ? matchedSystems : u.systems).map((s) => (
-                      <div
-                        key={s.id}
-                        className={`tn l2 ${
-                          viewLevel === 's' &&
-                          selectedUnitName === u.name &&
-                          selectedSystemName === s.name
-                            ? 'on'
-                            : ''
-                        }`}
-                      >
-                        <a
-                          href={`#${s.id}`}
-                          title={s.name}
-                          onClick={() => setTreeOpen(false)}
-                        >
-                          {s.name}
-                        </a>
-                        {renderPill(s.items)}
-                      </div>
-                    ))}
-                </React.Fragment>
-              );
-            })}
-          </div>
-        )}
-
-        {/* TAB 2: EXCEL & DATA MANAGEMENT TOOLS */}
-        {treeTab === 'tools' && (
-          <div style={{ flex: 1, overflowY: 'auto', padding: '14px 12px 20px' }}>
-            <div style={{ marginBottom: '14px' }}>
-              <div style={{ fontWeight: 700, fontSize: '13px', color: 'var(--tx)', marginBottom: '3px' }}>
-                🛠️ Excel &amp; Data Tools
-              </div>
-              <div style={{ fontSize: '11px', color: 'var(--mu)', lineHeight: 1.4 }}>
-                All Excel spreadsheet imports, exports, and blank template downloads are centralized here.
-              </div>
-            </div>
-
-            {/* 1. Upload Excel Card */}
-            <div
+          {/* Section Header for 7 Units + 8 UTILITY Sub-Units + Equipment */}
+          <div
+            style={{
+              padding: '12px 14px 6px',
+              marginTop: '4px',
+              borderTop: '1px solid var(--bd)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '6px',
+            }}
+          >
+            <span
               style={{
-                background: 'var(--tr)',
-                border: '1px dashed var(--ac)',
-                borderRadius: '8px',
-                padding: '12px',
-                marginBottom: '12px',
-                textAlign: 'center',
-              }}
-            >
-              <div style={{ fontSize: '24px', marginBottom: '4px' }}>📊</div>
-              <b style={{ fontSize: '12.5px', color: 'var(--tx)', display: 'block', marginBottom: '4px' }}>
-                Upload Updated Excel File
-              </b>
-              <span style={{ fontSize: '11px', color: 'var(--mu)', display: 'block', marginBottom: '10px', lineHeight: 1.3 }}>
-                Upload .xlsx, .xlsm, or .xls file. Automatically parses and updates Cloud Firestore database.
-              </span>
-              {isEditor ? (
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  style={{
-                    width: '100%',
-                    background: 'var(--ac)',
-                    color: '#fff',
-                    border: 'none',
-                    padding: '8px 12px',
-                    fontSize: '12px',
-                    fontWeight: 700,
-                    borderRadius: '5px',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: '6px',
-                  }}
-                >
-                  <span>⬆️</span> Choose Excel to Upload
-                </button>
-              ) : (
-                <div style={{ fontSize: '11px', color: 'var(--am)', background: 'var(--amb)', padding: '5px', borderRadius: '4px' }}>
-                  🔒 Editor role required to upload Excel files.
-                </div>
-              )}
-            </div>
-
-            {/* 2. Download Excel Template Card */}
-            <div
-              style={{
-                background: 'var(--cd)',
-                border: '1px solid var(--bd)',
-                borderRadius: '8px',
-                padding: '12px',
-                marginBottom: '12px',
-              }}
-            >
-              <b style={{ fontSize: '12px', color: 'var(--tx)', display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-                <span>📋</span> Download Blank Excel Template
-              </b>
-              <p style={{ fontSize: '11px', color: 'var(--mu)', margin: '0 0 10px', lineHeight: 1.35 }}>
-                Standard blank Excel template with all 22 required column headers and sample equipment rows.
-              </p>
-              <button
-                type="button"
-                onClick={handleDownloadTemplate}
-                style={{
-                  width: '100%',
-                  background: 'var(--tr)',
-                  border: '1px solid var(--bd)',
-                  padding: '7px 12px',
-                  fontSize: '12px',
-                  fontWeight: 600,
-                  borderRadius: '5px',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: '6px',
-                  color: 'var(--tx)',
-                }}
-              >
-                <span>📥</span> Download Template (.xlsx)
-              </button>
-            </div>
-
-            {/* 3. Export Current Database */}
-            <div
-              style={{
-                background: 'var(--cd)',
-                border: '1px solid var(--bd)',
-                borderRadius: '8px',
-                padding: '12px',
-                marginBottom: '12px',
-              }}
-            >
-              <b style={{ fontSize: '12px', color: 'var(--tx)', display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-                <span>💾</span> Export Current Database
-              </b>
-              <p style={{ fontSize: '11px', color: 'var(--mu)', margin: '0 0 10px', lineHeight: 1.35 }}>
-                Export all {equipment.length} equipment with updated inspection stages, dates, and remarks to Excel.
-              </p>
-              <button
-                type="button"
-                onClick={handleExcelDownload}
-                style={{
-                  width: '100%',
-                  background: 'var(--tr)',
-                  border: '1px solid var(--bd)',
-                  padding: '7px 12px',
-                  fontSize: '12px',
-                  fontWeight: 600,
-                  borderRadius: '5px',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: '6px',
-                  color: 'var(--tx)',
-                }}
-              >
-                <span>⬇️</span> Export All Equipment (.xlsx)
-              </button>
-            </div>
-
-            {/* 4. Column Guidelines Info */}
-            <div
-              style={{
-                background: 'var(--tr)',
-                border: '1px solid var(--bd)',
-                borderRadius: '6px',
-                padding: '10px',
-                fontSize: '10.5px',
+                fontSize: '10px',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                letterSpacing: '0.6px',
                 color: 'var(--mu)',
-                lineHeight: 1.45,
               }}
             >
-              <b style={{ color: 'var(--tx)', display: 'block', marginBottom: '3px' }}>💡 Excel Formatting Guide:</b>
-              <div>• Sheet name: <b>Equipment Master</b></div>
-              <div>• Key column: <b>Equipment Tag No.</b></div>
-              <div>• Status values: <b>Completed</b>, <b>In progress</b>, <b>Not started</b>, <b>Not applicable</b></div>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 3: ADMIN TOOLS (FOR ADMINS ONLY) */}
-        {treeTab === 'admin' && isAdmin && (
-          <div style={{ flex: 1, overflowY: 'auto', padding: '14px 12px 20px' }}>
-            <div style={{ marginBottom: '14px' }}>
-              <div style={{ fontWeight: 700, fontSize: '13px', color: 'var(--tx)', marginBottom: '3px' }}>
-                ⚙️ Admin Administration
-              </div>
-              <div style={{ fontSize: '11px', color: 'var(--mu)', lineHeight: 1.4 }}>
-                Manage team access, assign passwords, configure user roles, and audit system activities.
-              </div>
-            </div>
-
-            {/* Launch Admin Console */}
+              Units, Sub-Units &amp; Equipment
+            </span>
             <button
               type="button"
               onClick={() => {
-                setTreeOpen(false);
-                setShowAdminPanel(true);
+                const allUnitIds = treeData.map((u) => u.id);
+                const utilitySysIds = treeData.find((u) => u.name === 'UTILITY')?.systems.map((s) => s.id) || [];
+                if (expandedUnits.size >= allUnitIds.length) {
+                  setExpandedUnits(new Set(['unit-7']));
+                  setExpandedSystems(new Set());
+                } else {
+                  setExpandedUnits(new Set(allUnitIds));
+                  setExpandedSystems(new Set(utilitySysIds));
+                }
               }}
               style={{
-                width: '100%',
-                background: 'var(--ac)',
-                color: '#fff',
-                border: 'none',
-                padding: '10px 14px',
-                fontSize: '12.5px',
-                fontWeight: 700,
-                borderRadius: '6px',
-                cursor: 'pointer',
-                marginBottom: '14px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '8px',
-                boxShadow: '0 2px 6px rgba(20, 89, 143, 0.3)',
-              }}
-            >
-              <span>⚙️</span>
-              <span>Open Full Admin Panel</span>
-            </button>
-
-            {/* Admin Capabilities Summary */}
-            <div
-              style={{
-                background: 'var(--tr)',
+                fontSize: '10px',
+                padding: '1px 6px',
+                borderRadius: '4px',
                 border: '1px solid var(--bd)',
-                borderRadius: '6px',
-                padding: '10px 12px',
-                marginBottom: '14px',
-                fontSize: '11px',
-                lineHeight: 1.5,
+                background: 'var(--tr)',
+                color: 'var(--ac)',
+                fontWeight: 600,
+                cursor: 'pointer',
               }}
+              title="Expand or Collapse all Units & Sub-Units"
             >
-              <b style={{ color: 'var(--tx)', display: 'block', marginBottom: '4px' }}>Admin Capabilities:</b>
-              <div>✓ Assign user passwords &amp; credentials</div>
-              <div>✓ Change user roles (Admin / Editor / Viewer)</div>
-              <div>✓ Approve or revoke team access</div>
-              <div>✓ View live Firestore audit logs</div>
-            </div>
-
-            {/* Reset Database Button */}
-            <div
-              style={{
-                background: '#fee2e2',
-                border: '1px solid #fecaca',
-                borderRadius: '6px',
-                padding: '10px 12px',
-              }}
-            >
-              <b style={{ fontSize: '11.5px', color: '#991b1b', display: 'block', marginBottom: '3px' }}>
-                Reset Database
-              </b>
-              <span style={{ fontSize: '10.5px', color: '#7f1d1d', display: 'block', marginBottom: '8px', lineHeight: 1.3 }}>
-                Restore all records to default factory sample data.
-              </span>
-              <button
-                type="button"
-                onClick={() => {
-                  if (confirm('Return to sample data? All local modifications will be reset.')) {
-                    resetToSampleData();
-                    setTreeOpen(false);
-                  }
-                }}
-                style={{
-                  background: '#dc2626',
-                  color: '#fff',
-                  border: 'none',
-                  padding: '6px 12px',
-                  fontSize: '11px',
-                  fontWeight: 700,
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                }}
-              >
-                ↺ Reset to Sample Data
-              </button>
-            </div>
+              {expandedUnits.size >= treeData.length ? 'Collapse All' : 'Expand All'}
+            </button>
           </div>
-        )}
+
+          {/* 7 Main Units -> (For UTILITY: 8 Sub-Units -> Equipment) | (For RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB: Equipment directly inside) */}
+          {treeData.map((u) => {
+            const tf = treeFilter.trim().toLowerCase();
+            const isUtility = u.name === 'UTILITY';
+            const unitMatches = u.name.toLowerCase().includes(tf);
+
+            // For non-UTILITY units: filter equipment directly inside the unit
+            const matchedUnitEquip = u.items.filter(
+              (eq) =>
+                unitMatches ||
+                eq.EquipmentTagNo.toLowerCase().includes(tf) ||
+                (eq.EquipmentDescription || '').toLowerCase().includes(tf)
+            );
+
+            // For UTILITY: filter sub-units and equipment inside each sub-unit
+            const matchedSubUnits = u.systems.filter((s) => {
+              const subMatches = unitMatches || s.name.toLowerCase().includes(tf);
+              const eqMatches = s.items.some(
+                (eq) =>
+                  eq.EquipmentTagNo.toLowerCase().includes(tf) ||
+                  (eq.EquipmentDescription || '').toLowerCase().includes(tf)
+              );
+              return subMatches || eqMatches;
+            });
+
+            if (tf) {
+              if (isUtility && !unitMatches && matchedSubUnits.length === 0) return null;
+              if (!isUtility && !unitMatches && matchedUnitEquip.length === 0) return null;
+            }
+
+            const isUnitExpanded = tf ? true : expandedUnits.has(u.id);
+
+            return (
+              <React.Fragment key={u.id}>
+                {/* LEVEL 1: MAIN UNIT ROW (RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB, UTILITY) */}
+                <div
+                  className={`tn l1 ${viewLevel === 'u' && selectedUnitName === u.name ? 'on' : ''}`}
+                  onClick={() => {
+                    window.location.hash = u.id;
+                    setExpandedUnits((prev) => {
+                      const next = new Set(prev);
+                      next.add(u.id);
+                      return next;
+                    });
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="tg"
+                    title={isUnitExpanded ? `Collapse ${u.name}` : `Expand ${u.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedUnits((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(u.id)) next.delete(u.id);
+                        else next.add(u.id);
+                        return next;
+                      });
+                    }}
+                  >
+                    {isUnitExpanded ? '▾' : '▸'}
+                  </button>
+                  <a
+                    href={`#${u.id}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedUnits((prev) => new Set([...prev, u.id]));
+                    }}
+                    style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
+                  >
+                    <span>{u.name}</span>
+                    {isUtility ? (
+                      <span
+                        style={{
+                          fontSize: '9.5px',
+                          fontWeight: 700,
+                          padding: '0px 5px',
+                          borderRadius: '4px',
+                          background: '#e0f2fe',
+                          color: '#0369a1',
+                          border: '1px solid #bae6fd',
+                        }}
+                      >
+                        8 Sub-Units
+                      </span>
+                    ) : (
+                      <span
+                        style={{
+                          fontSize: '9.5px',
+                          fontWeight: 600,
+                          color: 'var(--mu)',
+                        }}
+                      >
+                        ({u.items.length} eq)
+                      </span>
+                    )}
+                  </a>
+                  {renderPill(u.items)}
+                </div>
+
+                {/* IF UNIT IS UTILITY: SHOW 8 SUB-UNITS (DM-CPU, N2U, CA-IA, BOILERS AND HRSG, COOLING TOWER, RWDU, RW FILTER, RW RESERVOIR) -> AND EQUIPMENT INSIDE EACH SUB-UNIT */}
+                {isUnitExpanded &&
+                  isUtility &&
+                  (tf ? matchedSubUnits : u.systems).map((s) => {
+                    const isSubExpanded = tf ? true : expandedSystems.has(s.id);
+                    const subEquipList = tf
+                      ? s.items.filter(
+                          (eq) =>
+                            unitMatches ||
+                            s.name.toLowerCase().includes(tf) ||
+                            eq.EquipmentTagNo.toLowerCase().includes(tf) ||
+                            (eq.EquipmentDescription || '').toLowerCase().includes(tf)
+                        )
+                      : s.items;
+
+                    return (
+                      <React.Fragment key={s.id}>
+                        {/* LEVEL 2 (UNDER UTILITY): SUB-UNIT ROW */}
+                        <div
+                          className={`tn l2 ${
+                            viewLevel === 's' &&
+                            selectedUnitName === u.name &&
+                            selectedSystemName === s.name
+                              ? 'on'
+                              : ''
+                          }`}
+                          onClick={() => {
+                            window.location.hash = s.id;
+                            setExpandedSystems((prev) => new Set([...prev, s.id]));
+                          }}
+                        >
+                          <button
+                            type="button"
+                            className="tg"
+                            title={isSubExpanded ? `Collapse ${s.name}` : `Expand equipment in ${s.name}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setExpandedSystems((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(s.id)) next.delete(s.id);
+                                else next.add(s.id);
+                                return next;
+                              });
+                            }}
+                          >
+                            {isSubExpanded ? '▾' : '▸'}
+                          </button>
+                          <a
+                            href={`#${s.id}`}
+                            title={`${s.name} (${s.items.length} Equipment)`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setExpandedSystems((prev) => new Set([...prev, s.id]));
+                            }}
+                            style={{ display: 'flex', alignItems: 'center', gap: '5px' }}
+                          >
+                            <span style={{ fontWeight: 600 }}>{s.name}</span>
+                            <span style={{ fontSize: '9.5px', color: 'var(--mu)' }}>
+                              ({s.items.length} eq)
+                            </span>
+                          </a>
+                          {renderPill(s.items)}
+                        </div>
+
+                        {/* LEVEL 3 (UNDER UTILITY SUB-UNIT): EQUIPMENT ITEMS INSIDE THIS SUB-UNIT */}
+                        {isSubExpanded &&
+                          subEquipList.map((eq) => (
+                            <div
+                              key={eq.id}
+                              className={`tn l3 ${
+                                viewLevel === 'e' && selectedEquipmentTag === eq.EquipmentTagNo ? 'on' : ''
+                              }`}
+                              onClick={() => {
+                                window.location.hash = `eq-${encodeURIComponent(eq.EquipmentTagNo)}`;
+                                setTreeOpen(false);
+                              }}
+                            >
+                              <span style={{ fontSize: '10px', color: 'var(--ac)', flexShrink: 0 }}>•</span>
+                              <a
+                                href={`#eq-${encodeURIComponent(eq.EquipmentTagNo)}`}
+                                title={`${eq.EquipmentTagNo} — ${eq.EquipmentDescription || ''}`}
+                                onClick={() => setTreeOpen(false)}
+                              >
+                                <b style={{ fontSize: '11px' }}>{eq.EquipmentTagNo}</b>
+                                {eq.EquipmentDescription ? (
+                                  <span style={{ color: 'var(--mu)', fontSize: '10.5px', marginLeft: '4px' }}>
+                                    · {eq.EquipmentDescription}
+                                  </span>
+                                ) : null}
+                              </a>
+                              {renderPill([eq])}
+                            </div>
+                          ))}
+                      </React.Fragment>
+                    );
+                  })}
+
+                {/* IF UNIT IS ONE OF THE 6 PROCESS UNITS (RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB): SHOW EQUIPMENT DIRECTLY INSIDE THE UNIT */}
+                {isUnitExpanded &&
+                  !isUtility &&
+                  (tf ? matchedUnitEquip : u.items).map((eq) => (
+                    <div
+                      key={eq.id}
+                      className={`tn l2 ${
+                        viewLevel === 'e' && selectedEquipmentTag === eq.EquipmentTagNo ? 'on' : ''
+                      }`}
+                      onClick={() => {
+                        window.location.hash = `eq-${encodeURIComponent(eq.EquipmentTagNo)}`;
+                        setTreeOpen(false);
+                      }}
+                    >
+                      <span style={{ fontSize: '10px', color: 'var(--ac)', flexShrink: 0 }}>•</span>
+                      <a
+                        href={`#eq-${encodeURIComponent(eq.EquipmentTagNo)}`}
+                        title={`${eq.EquipmentTagNo} — ${eq.EquipmentDescription || ''}`}
+                        onClick={() => setTreeOpen(false)}
+                      >
+                        <b style={{ fontSize: '11.5px' }}>{eq.EquipmentTagNo}</b>
+                        {eq.EquipmentDescription ? (
+                          <span style={{ color: 'var(--mu)', fontSize: '10.5px', marginLeft: '4px' }}>
+                            · {eq.EquipmentDescription}
+                          </span>
+                        ) : null}
+                      </a>
+                      {renderPill([eq])}
+                    </div>
+                  ))}
+              </React.Fragment>
+            );
+          })}
+        </div>
 
         {/* Drawer Sticky Bottom Footer */}
         <div
@@ -2632,12 +2408,13 @@ export default function Dashboard() {
             <span style={{ color: 'var(--mu)', display: 'block', fontSize: '9.5px', textTransform: 'uppercase' }}>Logged in as</span>
             <b style={{ color: 'var(--tx)', fontSize: '11.5px' }}>{profile?.displayName || user?.email?.split('@')[0] || 'User'}</b>
           </div>
-          {isAdmin ? (
+          {(isAdmin || isEditor) ? (
             <button
               type="button"
               onClick={() => {
+                window.location.hash = 'admin';
+                setViewLevel('admin');
                 setTreeOpen(false);
-                setShowAdminPanel(true);
               }}
               style={{
                 padding: '4px 8px',
@@ -2650,7 +2427,7 @@ export default function Dashboard() {
                 cursor: 'pointer',
               }}
             >
-              ⚙ Admin
+              ⚙ Admin DB
             </button>
           ) : (
             <span style={{ color: 'var(--mu)', fontSize: '10.5px' }}>{profile?.role || 'viewer'}</span>
@@ -3245,8 +3022,8 @@ export default function Dashboard() {
                             <th>System</th>
                             <th>Status</th>
                             <th>Progress</th>
-                            <th>Last insp.</th>
-                            <th>Link</th>
+                            <th>Base Line UTG</th>
+                            <th>Document/Drawing</th>
                             {isEditor && <th style={{ textAlign: 'center' }}>Action</th>}
                           </tr>
                         </thead>
@@ -3261,7 +3038,9 @@ export default function Dashboard() {
                                 r.EquipmentTagNo?.toLowerCase().includes(q) ||
                                 r.EquipmentDescription?.toLowerCase().includes(q) ||
                                 r.Unit?.toLowerCase().includes(q) ||
-                                r.SystemNo?.toLowerCase().includes(q)
+                                r.SystemNo?.toLowerCase().includes(q) ||
+                                r.BaseLineUTG?.toLowerCase().includes(q) ||
+                                r.DocumentDrawing?.toLowerCase().includes(q)
                               );
                             })
                             .map((r) => (
@@ -3276,16 +3055,8 @@ export default function Dashboard() {
                                 <td>{r.SystemNo}</td>
                                 <td>{renderStatusChip(getEquipmentOverallStatus(r))}</td>
                                 <td>{calculateProgress([r])}%</td>
-                                <td>{r.LastInspectionDate || '—'}</td>
-                                <td>
-                                  {r.Link ? (
-                                    <a href={r.Link} target="_blank" rel="noopener noreferrer">
-                                      Open ↗
-                                    </a>
-                                  ) : (
-                                    ''
-                                  )}
-                                </td>
+                                <td>{renderStatusChip(r.BaseLineUTG)}</td>
+                                <td>{renderDocumentDrawing(r.DocumentDrawing)}</td>
                                 {isEditor && (
                                   <td style={{ textAlign: 'center' }}>
                                     <button
@@ -3323,21 +3094,6 @@ export default function Dashboard() {
             {/* When NO KPI filter is active: show the standard full home page overview */}
             {!kpiFilter && (
               <>
-                {/* 2-Column Grid with Ring and Stage Bars */}
-                <div className="g2">
-                  <div className="cd">
-                    <h3>Overall equipment status</h3>
-                    {renderDonutChart(stats)}
-                  </div>
-                  <div className="cd">
-                    <h3>Stage-wise status — all units</h3>
-                    {renderStageWiseBars(equipment)}
-                  </div>
-                </div>
-
-                {/* Unit-wise Progress & Completion Bar Chart (Completed vs Remaining) */}
-                {renderUnitWiseProgressBarChart()}
-
                 {/* Unit-wise Matrix Table */}
                 <div className="cd">
                   <h3>Unit-wise status and pending (level 1 of hierarchy)</h3>
@@ -3356,9 +3112,9 @@ export default function Dashboard() {
                           <th>Completed</th>
                           <th>In prog.</th>
                           <th>Not started</th>
-                          <th style={{ minWidth: '150px' }}>Status</th>
+                          <th style={{ minWidth: '175px' }}>Stage Progress</th>
                           {STATUS_COLUMNS.map((col) => (
-                            <th key={col.key} className="ct" title="Pending equipment count">
+                            <th key={col.key} className="ct" title={`Pending equipment count (${col.pendingValue})`}>
                               {col.short}
                             </th>
                           ))}
@@ -3374,8 +3130,23 @@ export default function Dashboard() {
                             return (
                               <tr key={u.id}>
                                 <td>
-                                  <a href={`#${u.id}`}>
+                                  <a href={`#${u.id}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
                                     <b>{u.name}</b>
+                                    {u.name === 'UTILITY' && (
+                                      <span
+                                        style={{
+                                          fontSize: '9.5px',
+                                          fontWeight: 700,
+                                          padding: '1px 5px',
+                                          borderRadius: '4px',
+                                          background: '#e0f2fe',
+                                          color: '#0369a1',
+                                          border: '1px solid #bae6fd',
+                                        }}
+                                      >
+                                        8 Sub-Units
+                                      </span>
+                                    )}
                                   </a>
                                 </td>
                                 <td>{u.items.length}</td>
@@ -3398,8 +3169,22 @@ export default function Dashboard() {
                     </table>
                   </div>
                   <div className="note">
-                    Stage columns show the number of equipment still pending (not done and not N/A). Click a name to drill
-                    down.
+                    Percentage is calculated from the 6 stage dropdowns (Format-I/II/III = Issued, Internal Insp. = Yes, Base Line UTG = Yes, Final Accept. = Accept) rolled up across the hierarchy. Stage columns show pending equipment count.
+                  </div>
+                </div>
+
+                {/* 3-Column Overview Row: Overall equipment status | Unit-Wise Vertical Pillar Chart | Stage-wise status — all units */}
+                <div className="g3-overview">
+                  <div className="cd overall-status-cd">
+                    <h3>Overall equipment status</h3>
+                    <div className="overall-status-body">
+                      {renderDonutChart(stats)}
+                    </div>
+                  </div>
+                  {renderUnitWiseProgressBarChart()}
+                  <div className="cd">
+                    <h3>Stage-wise status — all units</h3>
+                    {renderStageWiseBars(equipment)}
                   </div>
                 </div>
               </>
@@ -3671,8 +3456,8 @@ export default function Dashboard() {
                             <th>System</th>
                             <th>Status</th>
                             <th>Progress</th>
-                            <th>Last insp.</th>
-                            <th>Link</th>
+                            <th>Base Line UTG</th>
+                            <th>Document/Drawing</th>
                             {isEditor && <th style={{ textAlign: 'center' }}>Action</th>}
                           </tr>
                         </thead>
@@ -3686,7 +3471,9 @@ export default function Dashboard() {
                               return (
                                 r.EquipmentTagNo?.toLowerCase().includes(q) ||
                                 r.EquipmentDescription?.toLowerCase().includes(q) ||
-                                r.SystemNo?.toLowerCase().includes(q)
+                                r.SystemNo?.toLowerCase().includes(q) ||
+                                r.BaseLineUTG?.toLowerCase().includes(q) ||
+                                r.DocumentDrawing?.toLowerCase().includes(q)
                               );
                             })
                             .map((r) => (
@@ -3700,16 +3487,8 @@ export default function Dashboard() {
                                 <td>{r.SystemNo}</td>
                                 <td>{renderStatusChip(getEquipmentOverallStatus(r))}</td>
                                 <td>{calculateProgress([r])}%</td>
-                                <td>{r.LastInspectionDate || '—'}</td>
-                                <td>
-                                  {r.Link ? (
-                                    <a href={r.Link} target="_blank" rel="noopener noreferrer">
-                                      Open ↗
-                                    </a>
-                                  ) : (
-                                    ''
-                                  )}
-                                </td>
+                                <td>{renderStatusChip(r.BaseLineUTG)}</td>
+                                <td>{renderDocumentDrawing(r.DocumentDrawing)}</td>
                                 {isEditor && (
                                   <td style={{ textAlign: 'center' }}>
                                     <button
@@ -3744,30 +3523,35 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* When NO KPI filter is active in Unit view: show standard unit overview */}
+            {/* When NO KPI filter is active in Unit view: show unit overview + Sub-Units (for UTILITY) + Equipment list */}
             {!kpiFilter && (
               <>
                 <div className="g2">
-                  <div className="cd">
+                  <div className="cd overall-status-cd">
                     <h3>Equipment status</h3>
-                    {renderDonutChart(stats)}
+                    <div className="overall-status-body">
+                      {renderDonutChart(stats)}
+                    </div>
                   </div>
                   <div className="cd">
-                    <h3>Stage-wise status</h3>
+                    <h3>Stage-wise status — {activeUnit.name}</h3>
                     {renderStageWiseBars(activeUnit.items)}
                   </div>
                 </div>
 
-                <div className="cd">
-                  <h3>Systems in this unit (level 2)</h3>
-                  {activeUnit.systems.length === 0 ? (
-                    <div className="empty">No equipment in this unit yet. Add rows in Excel and upload.</div>
-                  ) : (
+                {/* For UTILITY: Display the 8 Sub-Units Matrix Table (DM-CPU, N2U, CA-IA, BOILERS AND HRSG, COOLING TOWER, RWDU, RW FILTER, RW RESERVOIR) */}
+                {activeUnit.name === 'UTILITY' && (
+                  <div className="cd">
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px', marginBottom: '8px' }}>
+                      <h3 style={{ margin: 0 }}>
+                        Sub-Units in UTILITY (8 Sub-Units — Click a Sub-Unit to open its Equipment)
+                      </h3>
+                    </div>
                     <div className="tw">
                       <table className="nrep-table">
                         <thead>
                           <tr>
-                            <th>System</th>
+                            <th>Sub-Unit (UTILITY)</th>
                             <th>Equip.</th>
                             <th>Completed</th>
                             <th>In prog.</th>
@@ -3811,6 +3595,196 @@ export default function Dashboard() {
                         </tbody>
                       </table>
                     </div>
+                  </div>
+                )}
+
+                {/* Direct Equipment Table inside the Unit (for RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB and also UTILITY) */}
+                <div className="cd">
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', marginBottom: '10px' }}>
+                    <h3 style={{ margin: 0 }}>
+                      {activeUnit.name === 'UTILITY'
+                        ? 'All Equipment in UTILITY (Across 8 Sub-Units)'
+                        : `Equipment List in ${activeUnit.name} (${activeUnit.items.length} Equipment)`}
+                    </h3>
+                    {isEditor && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEditingEquipment({
+                            id: '',
+                            Unit: activeUnit.name,
+                            SubUnit: activeUnit.name === 'UTILITY' ? UTILITY_SUB_UNITS[0] : '',
+                            SystemNo: activeUnit.name === 'UTILITY' ? UTILITY_SUB_UNITS[0] : `${activeUnit.name} Main System`,
+                            EquipmentTagNo: '',
+                            EquipmentDescription: '',
+                            EquipmentType: '',
+                            FormatIStatus: 'Not Issued',
+                            FormatIIStatus: 'Not Issued',
+                            FormatIIIStatus: 'Not Issued',
+                            InternalInspectionStatus: 'No',
+                            BaseLineUTG: 'No',
+                            FinalSystemAcceptance: 'Not accept',
+                            DocumentDrawing: '',
+                            Remarks: '',
+                          })
+                        }
+                        style={{
+                          padding: '5px 12px',
+                          fontSize: '11.5px',
+                          fontWeight: 700,
+                          background: 'var(--ac)',
+                          color: '#fff',
+                          border: 'none',
+                          borderRadius: '5px',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        ➕ Add Equipment to {activeUnit.name}
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="tools">
+                    <input
+                      placeholder="🔍 Search tag, description, sub-unit, Base Line UTG, Document/Drawing, remarks…"
+                      value={systemSearch}
+                      onChange={(e) => setSystemSearch(e.target.value)}
+                    />
+                    <select
+                      value={systemStatusFilter}
+                      onChange={(e) => setSystemStatusFilter(e.target.value)}
+                    >
+                      <option value="">All Statuses</option>
+                      <option value="Completed">Completed</option>
+                      <option value="In progress">In progress</option>
+                      <option value="Not started">Not started</option>
+                    </select>
+                  </div>
+
+                  {activeUnit.items.length === 0 ? (
+                    <div className="empty">No equipment in {activeUnit.name} yet. Click &quot;+ Add Equipment&quot; above to add records.</div>
+                  ) : (
+                    <div className="tw">
+                      <table className="nrep-table">
+                        <thead>
+                          <tr>
+                            <th>Tag No.</th>
+                            {activeUnit.name === 'UTILITY' && <th>Sub-Unit</th>}
+                            <th>Description</th>
+                            <th>Type</th>
+                            <th>Status</th>
+                            <th>Progress</th>
+                            {STATUS_COLUMNS.map((col) => (
+                              <th key={col.key}>{col.short}</th>
+                            ))}
+                            <th>Document/Drawing</th>
+                            {isEditor && <th style={{ textAlign: 'center' }}>Action</th>}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {activeUnit.items
+                            .filter((r) => {
+                              const q = systemSearch.toLowerCase();
+                              const matchesSearch =
+                                !q || Object.values(r).join(' ').toLowerCase().includes(q);
+                              const matchesFilter =
+                                !systemStatusFilter || getEquipmentOverallStatus(r) === systemStatusFilter;
+                              return matchesSearch && matchesFilter;
+                            })
+                            .map((r) => {
+                              const overall = getEquipmentOverallStatus(r);
+                              const eqPct = calculateProgress([r]);
+                              return (
+                                <tr key={r.id}>
+                                  <td>
+                                    <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
+                                      <b>{r.EquipmentTagNo}</b>
+                                    </a>
+                                  </td>
+                                  {activeUnit.name === 'UTILITY' && (
+                                    <td>
+                                      <span className="c a" style={{ fontWeight: 700 }}>
+                                        {r.SubUnit || r.SystemNo}
+                                      </span>
+                                    </td>
+                                  )}
+                                  <td>{r.EquipmentDescription || '—'}</td>
+                                  <td>{r.EquipmentType || '—'}</td>
+                                  <td>{renderStatusChip(overall === 'Not started' ? '' : overall)}</td>
+                                  <td>
+                                    <span className={`pl ${eqPct === 100 ? 'g' : eqPct > 0 ? 'a' : ''}`}>
+                                      {eqPct}%
+                                    </span>
+                                  </td>
+                                  {STATUS_COLUMNS.map((col) => {
+                                    const val = (r[col.key] as string) || col.pendingValue;
+                                    return (
+                                      <td key={col.key}>
+                                        {isEditor ? (
+                                          <select
+                                            value={val}
+                                            style={{
+                                              fontSize: '11px',
+                                              padding: '3px 6px',
+                                              borderRadius: '4px',
+                                              border: '1px solid #cbd5e1',
+                                              background: isDone(val) ? '#f0fdf4' : '#fffbeb',
+                                              color: isDone(val) ? '#15803d' : '#b45309',
+                                              fontWeight: 600,
+                                              cursor: 'pointer',
+                                            }}
+                                            title={`Change ${col.label}`}
+                                            onChange={async (e) => {
+                                              try {
+                                                await updateEquipmentField(r.id, col.key, e.target.value);
+                                              } catch (err: any) {
+                                                console.error(err.message);
+                                              }
+                                            }}
+                                          >
+                                            {col.options.map((opt) => (
+                                              <option key={opt} value={opt}>
+                                                {opt}
+                                              </option>
+                                            ))}
+                                          </select>
+                                        ) : (
+                                          renderStatusChip(val)
+                                        )}
+                                      </td>
+                                    );
+                                  })}
+                                  <td>{renderDocumentDrawing(r.DocumentDrawing)}</td>
+                                  {isEditor && (
+                                    <td style={{ textAlign: 'center', whiteSpace: 'nowrap' }}>
+                                      <button
+                                        type="button"
+                                        className="btn btn-sm"
+                                        style={{
+                                          padding: '3px 8px',
+                                          fontSize: '11px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px',
+                                          background: '#f0f7ff',
+                                          color: '#0284c7',
+                                          borderColor: '#bae6fd',
+                                          borderRadius: '4px',
+                                          cursor: 'pointer',
+                                        }}
+                                        title="Edit equipment record"
+                                        onClick={() => setEditingEquipment(r)}
+                                      >
+                                        Edit
+                                      </button>
+                                    </td>
+                                  )}
+                                </tr>
+                              );
+                            })}
+                        </tbody>
+                      </table>
+                    </div>
                   )}
                 </div>
               </>
@@ -3818,13 +3792,53 @@ export default function Dashboard() {
           </>
         )}
 
-        {/* LEVEL 3: SYSTEM VIEW WITH EQUIPMENT TABLE */}
+        {/* LEVEL 3: SUB-UNIT / SYSTEM VIEW WITH EQUIPMENT TABLE */}
         {viewLevel === 's' && activeUnit && activeSystem && (
           <>
             <div className="bc">
               <a href="#" onClick={goToHome}>NREP Project</a> › <a href={`#${activeUnit.id}`}>{activeUnit.name}</a> › {activeSystem.name}
             </div>
-            <h2 className="t">{activeSystem.name}</h2>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', marginBottom: '10px' }}>
+              <h2 className="t" style={{ margin: 0 }}>
+                {activeUnit.name === 'UTILITY' ? `Sub-Unit: ${activeSystem.name} (UTILITY)` : activeSystem.name}
+              </h2>
+              {isEditor && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setEditingEquipment({
+                      id: '',
+                      Unit: activeUnit.name,
+                      SubUnit: activeUnit.name === 'UTILITY' ? activeSystem.name : '',
+                      SystemNo: activeSystem.name,
+                      EquipmentTagNo: '',
+                      EquipmentDescription: '',
+                      EquipmentType: '',
+                      FormatIStatus: 'Not Issued',
+                      FormatIIStatus: 'Not Issued',
+                      FormatIIIStatus: 'Not Issued',
+                      InternalInspectionStatus: 'No',
+                      BaseLineUTG: 'No',
+                      FinalSystemAcceptance: 'Not accept',
+                      DocumentDrawing: '',
+                      Remarks: '',
+                    })
+                  }
+                  style={{
+                    padding: '6px 14px',
+                    fontSize: '12px',
+                    fontWeight: 700,
+                    background: 'var(--ac)',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  ➕ Add Equipment to {activeSystem.name}
+                </button>
+              )}
+            </div>
 
             {(() => {
               const compPct = stats.total ? Math.round((stats.completed / stats.total) * 100) : 0;
@@ -3888,7 +3902,7 @@ export default function Dashboard() {
                   {renderProfessionalKpiCard({
                     label: 'Stage Progress',
                     value: `${stats.progressPct}%`,
-                    subtext: '7-stage system progress',
+                    subtext: '6-stage system progress',
                     badgeText: 'Live',
                     pctBar: stats.progressPct,
                     theme: 'blue',
@@ -3901,9 +3915,11 @@ export default function Dashboard() {
             })()}
 
             <div className="g2">
-              <div className="cd">
+              <div className="cd overall-status-cd">
                 <h3>Equipment status</h3>
-                {renderDonutChart(stats)}
+                <div className="overall-status-body">
+                  {renderDonutChart(stats)}
+                </div>
               </div>
               <div className="cd">
                 <h3>Stage-wise status</h3>
@@ -3916,7 +3932,7 @@ export default function Dashboard() {
               <div className="tools">
                 <input
                   id="q"
-                  placeholder="Search tag, description, agency, remarks…"
+                  placeholder="Search tag, description, Base Line UTG, Document/Drawing, remarks…"
                   value={systemSearch}
                   onChange={(e) => setSystemSearch(e.target.value)}
                 />
@@ -3944,11 +3960,11 @@ export default function Dashboard() {
                           <th>Description</th>
                           <th>Type</th>
                           <th>Status</th>
+                          <th>Progress</th>
                           {STATUS_COLUMNS.map((col) => (
                             <th key={col.key}>{col.short}</th>
                           ))}
-                          <th>Last insp.</th>
-                          <th>Link</th>
+                          <th>Document/Drawing</th>
                           {isEditor && <th style={{ textAlign: 'center' }}>Action</th>}
                         </tr>
                       </thead>
@@ -3964,6 +3980,7 @@ export default function Dashboard() {
                           })
                           .map((r) => {
                             const overall = getEquipmentOverallStatus(r);
+                            const eqPct = calculateProgress([r]);
                             return (
                               <tr key={r.id}>
                                 <td>
@@ -3974,8 +3991,13 @@ export default function Dashboard() {
                                 <td>{r.EquipmentDescription || '—'}</td>
                                 <td>{r.EquipmentType || '—'}</td>
                                 <td>{renderStatusChip(overall === 'Not started' ? '' : overall)}</td>
+                                <td>
+                                  <span className={`pl ${eqPct === 100 ? 'g' : eqPct > 0 ? 'a' : ''}`}>
+                                    {eqPct}%
+                                  </span>
+                                </td>
                                 {STATUS_COLUMNS.map((col) => {
-                                  const val = (r[col.key] as string) || '';
+                                  const val = (r[col.key] as string) || col.pendingValue;
                                   return (
                                     <td key={col.key}>
                                       {isEditor ? (
@@ -3983,22 +4005,12 @@ export default function Dashboard() {
                                           value={val}
                                           style={{
                                             fontSize: '11px',
-                                            padding: '2px 4px',
+                                            padding: '3px 6px',
                                             borderRadius: '4px',
                                             border: '1px solid #cbd5e1',
-                                            background:
-                                              val === 'Completed'
-                                                ? '#f0fdf4'
-                                                : val === 'In progress'
-                                                ? '#fffbeb'
-                                                : '#ffffff',
-                                            color:
-                                              val === 'Completed'
-                                                ? '#15803d'
-                                                : val === 'In progress'
-                                                ? '#b45309'
-                                                : '#475569',
-                                            fontWeight: val ? 600 : 400,
+                                            background: isDone(val) ? '#f0fdf4' : '#fffbeb',
+                                            color: isDone(val) ? '#15803d' : '#b45309',
+                                            fontWeight: 600,
                                             cursor: 'pointer',
                                           }}
                                           title={`Change ${col.label}`}
@@ -4006,34 +4018,23 @@ export default function Dashboard() {
                                             try {
                                               await updateEquipmentField(r.id, col.key, e.target.value);
                                             } catch (err: any) {
-                                              alert(err.message);
+                                              console.error(err.message);
                                             }
                                           }}
                                         >
-                                          {STATUS_OPTIONS.map((opt) => (
+                                          {col.options.map((opt) => (
                                             <option key={opt} value={opt}>
-                                              {opt || '—'}
+                                              {opt}
                                             </option>
                                           ))}
                                         </select>
-                                      ) : val ? (
-                                        renderStatusChip(val)
                                       ) : (
-                                        <span className="c">—</span>
+                                        renderStatusChip(val)
                                       )}
                                     </td>
                                   );
                                 })}
-                                <td>{r.LastInspectionDate || '—'}</td>
-                                <td>
-                                  {r.Link ? (
-                                    <a href={r.Link} target="_blank" rel="noopener noreferrer">
-                                      Open ↗
-                                    </a>
-                                  ) : (
-                                    ''
-                                  )}
-                                </td>
+                                <td>{renderDocumentDrawing(r.DocumentDrawing)}</td>
                                 {isEditor && (
                                   <td style={{ textAlign: 'center', whiteSpace: 'nowrap' }}>
                                     <button
@@ -4054,21 +4055,21 @@ export default function Dashboard() {
                                       title="Edit equipment record"
                                       onClick={() => setEditingEquipment(r)}
                                     >
-                  Edit
-                </button>
-              </td>
-            )}
-          </tr>
-        );
-      })}
-  </tbody>
-</table>
-</div>
-)}
-</div>
-</div>
-</>
-)}
+                                      Edit
+                                    </button>
+                                  </td>
+                                )}
+                              </tr>
+                            );
+                          })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
+        )}
 
         {/* LEVEL 4: EQUIPMENT DETAIL (MATCHING REFERENCE pageE()) */}
         {viewLevel === 'e' && activeEquipment && (
@@ -4106,19 +4107,21 @@ export default function Dashboard() {
               )}
             </div>
 
-            {/* Title card with 7-step pipeline */}
+            {/* Title card with 6-step pipeline */}
             <div className="cd">
               <h3>
                 {activeEquipment.EquipmentDescription || ''} · {activeEquipment.EquipmentType || ''} ·{' '}
-                {renderStatusChip(getEquipmentOverallStatus(activeEquipment))}
+                {renderStatusChip(getEquipmentOverallStatus(activeEquipment))} ·{' '}
+                <span className="pl g" style={{ fontSize: '11.5px' }}>
+                  {calculateProgress([activeEquipment])}% Completed
+                </span>
               </h3>
 
               <div className="pipe">
                 {STATUS_COLUMNS.map((col) => {
-                  const val = (activeEquipment[col.key] as string) || '';
+                  const val = (activeEquipment[col.key] as string) || col.pendingValue;
                   const done = isDone(val);
-                  const prog = isInProgress(val);
-                  const borderCls = done ? 'g' : prog ? 'a' : '';
+                  const borderCls = done ? 'g' : 'a';
 
                   return (
                     <div key={col.key} className={`st ${borderCls}`}>
@@ -4129,39 +4132,29 @@ export default function Dashboard() {
                           style={{
                             fontSize: '11px',
                             fontWeight: 600,
-                            padding: '3px 4px',
+                            padding: '3px 6px',
                             borderRadius: '4px',
                             border: '1px solid #94a3b8',
-                            background:
-                              val === 'Completed'
-                                ? '#f0fdf4'
-                                : val === 'In progress'
-                                ? '#fffbeb'
-                                : '#ffffff',
-                            color:
-                              val === 'Completed'
-                                ? '#15803d'
-                                : val === 'In progress'
-                                ? '#b45309'
-                                : '#334155',
+                            background: done ? '#f0fdf4' : '#fffbeb',
+                            color: done ? '#15803d' : '#b45309',
                             cursor: 'pointer',
                           }}
                           onChange={async (e) => {
                             try {
                               await updateEquipmentField(activeEquipment.id, col.key, e.target.value);
                             } catch (err: any) {
-                              alert(err.message);
+                              console.error(err.message);
                             }
                           }}
                         >
-                          {STATUS_OPTIONS.map((opt) => (
+                          {col.options.map((opt) => (
                             <option key={opt} value={opt}>
-                              {opt || '— Not started'}
+                              {opt}
                             </option>
                           ))}
                         </select>
                       ) : (
-                        <b>{val || 'Not started'}</b>
+                        <b>{val}</b>
                       )}
                     </div>
                   );
@@ -4174,33 +4167,36 @@ export default function Dashboard() {
               <h3>Details</h3>
               <div className="dg">
                 <div>
-                  <label>RFI No.</label>
+                  <label>Base Line UTG</label>
                   <div>
                     {isEditor ? (
-                      <input
-                        type="text"
-                        defaultValue={activeEquipment.RFINo || ''}
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'RFINo', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
+                      <select
+                        value={activeEquipment.BaseLineUTG || 'No'}
+                        onChange={(e) => updateEquipmentField(activeEquipment.id, 'BaseLineUTG', e.target.value)}
+                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc', fontWeight: 600 }}
+                      >
+                        <option value="Yes">Yes</option>
+                        <option value="No">No</option>
+                      </select>
                     ) : (
-                      activeEquipment.RFINo || '—'
+                      activeEquipment.BaseLineUTG || 'No'
                     )}
                   </div>
                 </div>
 
                 <div>
-                  <label>Area / Package</label>
+                  <label>Document/Drawing</label>
                   <div>
                     {isEditor ? (
                       <input
                         type="text"
-                        defaultValue={activeEquipment.AreaPackage || ''}
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'AreaPackage', e.target.value)}
+                        defaultValue={activeEquipment.DocumentDrawing || ''}
+                        placeholder="Drawing No. or Document URL"
+                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'DocumentDrawing', e.target.value)}
                         style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
                       />
                     ) : (
-                      activeEquipment.AreaPackage || '—'
+                      renderDocumentDrawing(activeEquipment.DocumentDrawing)
                     )}
                   </div>
                 </div>
@@ -4272,38 +4268,6 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Last inspection</label>
-                  <div>
-                    {isEditor ? (
-                      <input
-                        type="date"
-                        defaultValue={activeEquipment.LastInspectionDate || ''}
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'LastInspectionDate', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
-                    ) : (
-                      activeEquipment.LastInspectionDate || '—'
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <label>Responsible agency / person</label>
-                  <div>
-                    {isEditor ? (
-                      <input
-                        type="text"
-                        defaultValue={activeEquipment.ResponsibleAgency || ''}
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'ResponsibleAgency', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
-                    ) : (
-                      activeEquipment.ResponsibleAgency || '—'
-                    )}
-                  </div>
-                </div>
-
-                <div>
                   <label>Remarks</label>
                   <div>
                     {isEditor ? (
@@ -4318,33 +4282,15 @@ export default function Dashboard() {
                     )}
                   </div>
                 </div>
-
-                <div>
-                  <label>Document link (URL)</label>
-                  <div>
-                    {isEditor ? (
-                      <input
-                        type="text"
-                        defaultValue={activeEquipment.Link || ''}
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'Link', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
-                    ) : (
-                      activeEquipment.Link || '—'
-                    )}
-                  </div>
-                </div>
               </div>
 
-              <p style={{ marginTop: '14px' }}>
-                {activeEquipment.Link ? (
-                  <a className="btn" href={activeEquipment.Link} target="_blank" rel="noopener noreferrer">
-                    Open linked document ↗
+              {activeEquipment.DocumentDrawing && /^https?:\/\//i.test(activeEquipment.DocumentDrawing) && (
+                <p style={{ marginTop: '14px' }}>
+                  <a className="btn" href={activeEquipment.DocumentDrawing} target="_blank" rel="noopener noreferrer">
+                    Open Document / Drawing ↗
                   </a>
-                ) : (
-                  <span className="note">No link yet.</span>
-                )}
-              </p>
+                </p>
+              )}
             </div>
 
             {/* Sibling navigation */}
@@ -4375,6 +4321,291 @@ export default function Dashboard() {
               );
             })()}
           </>
+        )}
+
+        {/* TASK VIEW: EXCEL & DATA MANAGEMENT TOOLS IN RIGHT PANE */}
+        {viewLevel === 'tools' && (
+          <div style={{ maxWidth: '1180px', margin: '0 auto' }}>
+            <div className="bc">
+              <a href="#" onClick={goToHome}>
+                NREP Project
+              </a>{' '}
+              › Excel &amp; Data Tools
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                gap: '12px',
+                marginBottom: '16px',
+              }}
+            >
+              <div>
+                <h1 style={{ margin: 0 }}>🛠️ Excel &amp; Data Management Tools</h1>
+                <p style={{ margin: '4px 0 0', fontSize: '12.5px', color: 'var(--mu)' }}>
+                  Import updated Excel spreadsheets, download standardized 18-column templates (including Base Line UTG &amp; Document/Drawing), or export the live database ({equipment.length} equipment records).
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                {(isAdmin || isEditor) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      window.location.hash = 'admin';
+                      setViewLevel('admin');
+                    }}
+                    style={{
+                      background: 'var(--ac)',
+                      color: '#fff',
+                      border: 'none',
+                      padding: '8px 14px',
+                      borderRadius: '6px',
+                      fontSize: '12px',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    ⚙️ Open Live Database Editor
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={goToHome}
+                  style={{
+                    background: 'var(--cd)',
+                    color: 'var(--tx)',
+                    border: '1px solid var(--bd)',
+                    padding: '8px 14px',
+                    borderRadius: '6px',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  ← Back to Dashboard
+                </button>
+              </div>
+            </div>
+
+            {excelNotice && (
+              <div
+                style={{
+                  marginBottom: '16px',
+                  padding: '12px 16px',
+                  borderRadius: '8px',
+                  fontSize: '12.5px',
+                  fontWeight: 600,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  background: excelNotice.type === 'ok' ? '#dcfce7' : '#fee2e2',
+                  color: excelNotice.type === 'ok' ? '#166534' : '#991b1b',
+                  border: `1px solid ${excelNotice.type === 'ok' ? '#86efac' : '#fca5a5'}`,
+                }}
+              >
+                <span>{excelNotice.text}</span>
+                <button
+                  type="button"
+                  onClick={() => setExcelNotice(null)}
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    color: 'inherit',
+                    cursor: 'pointer',
+                    fontWeight: 700,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+                gap: '16px',
+                marginBottom: '18px',
+              }}
+            >
+              {/* Card 1: Upload Excel */}
+              <div
+                className="card"
+                style={{
+                  border: '1.5px dashed var(--ac)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  justifyContent: 'space-between',
+                  padding: '20px',
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: '28px', marginBottom: '8px' }}>📊</div>
+                  <h3 style={{ margin: '0 0 6px', fontSize: '15px', color: 'var(--tx)' }}>
+                    Upload Updated Excel File
+                  </h3>
+                  <p style={{ fontSize: '12px', color: 'var(--mu)', lineHeight: 1.5, margin: '0 0 16px' }}>
+                    Upload an <b>.xlsx</b>, <b>.xlsm</b>, or <b>.xls</b> spreadsheet. Existing equipment tags are updated automatically and new tags are added to Cloud Firestore.
+                  </p>
+                </div>
+                {isEditor ? (
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    style={{
+                      width: '100%',
+                      background: 'var(--ac)',
+                      color: '#fff',
+                      border: 'none',
+                      padding: '10px 14px',
+                      fontSize: '12.5px',
+                      fontWeight: 700,
+                      borderRadius: '6px',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '6px',
+                    }}
+                  >
+                    <span>⬆️</span> Choose Excel File to Upload
+                  </button>
+                ) : (
+                  <div
+                    style={{
+                      fontSize: '11.5px',
+                      color: 'var(--am)',
+                      background: 'var(--amb)',
+                      padding: '8px 10px',
+                      borderRadius: '6px',
+                      textAlign: 'center',
+                    }}
+                  >
+                    🔒 Editor or Admin role required to upload Excel files.
+                  </div>
+                )}
+              </div>
+
+              {/* Card 2: Download Blank Template */}
+              <div
+                className="card"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  justifyContent: 'space-between',
+                  padding: '20px',
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: '28px', marginBottom: '8px' }}>📋</div>
+                  <h3 style={{ margin: '0 0 6px', fontSize: '15px', color: 'var(--tx)' }}>
+                    Download Blank Excel Template
+                  </h3>
+                  <p style={{ fontSize: '12px', color: 'var(--mu)', lineHeight: 1.5, margin: '0 0 16px' }}>
+                    Download the standard NREP Excel template containing all 18 required column headers (including <b>Base Line UTG</b> and <b>Document/Drawing</b>) and sample rows.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleDownloadTemplate}
+                  style={{
+                    width: '100%',
+                    background: 'var(--tr)',
+                    color: 'var(--tx)',
+                    border: '1px solid var(--bd)',
+                    padding: '10px 14px',
+                    fontSize: '12.5px',
+                    fontWeight: 700,
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '6px',
+                  }}
+                >
+                  <span>📥</span> Download Blank Template (.xlsx)
+                </button>
+              </div>
+
+              {/* Card 3: Export Current Live Database */}
+              <div
+                className="card"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  justifyContent: 'space-between',
+                  padding: '20px',
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: '28px', marginBottom: '8px' }}>💾</div>
+                  <h3 style={{ margin: '0 0 6px', fontSize: '15px', color: 'var(--tx)' }}>
+                    Export Live Database to Excel
+                  </h3>
+                  <p style={{ fontSize: '12px', color: 'var(--mu)', lineHeight: 1.5, margin: '0 0 16px' }}>
+                    Export all <b>{equipment.length}</b> equipment records with current inspection statuses, Base Line UTG, Document/Drawing, dates, and remarks.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleExcelDownload}
+                  style={{
+                    width: '100%',
+                    background: '#059669',
+                    color: '#fff',
+                    border: 'none',
+                    padding: '10px 14px',
+                    fontSize: '12.5px',
+                    fontWeight: 700,
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '6px',
+                  }}
+                >
+                  <span>⬇️</span> Export All {equipment.length} Records (.xlsx)
+                </button>
+              </div>
+            </div>
+
+            <div className="card" style={{ padding: '18px 20px' }}>
+              <h3 style={{ margin: '0 0 8px', fontSize: '13.5px', color: 'var(--tx)' }}>
+                💡 Excel Formatting &amp; Column Guidelines (18 Columns)
+              </h3>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+                  gap: '12px',
+                  fontSize: '12px',
+                  color: 'var(--mu)',
+                  lineHeight: 1.6,
+                }}
+              >
+                <div>
+                  • <b>Worksheet Name:</b> <code>Equipment Master</code> (or first sheet)
+                  <br />• <b>Primary Key Column:</b> <code>Equipment Tag No.</code>
+                </div>
+                <div>
+                  • <b>6 Tracked Stages:</b> Format-I, Format-II, Format-III, Internal Inspection Status, Base Line UTG, Final System Acceptance
+                </div>
+                <div>
+                  • <b>Template Columns:</b> <code>Unit</code>, <code>Sub-Unit</code>, <code>System No.</code>, <code>Equipment Tag No.</code>, <code>Equipment Description</code>, <code>Equipment Type</code>, <code>Format-I/II/III Status &amp; Date</code>, <code>Internal Inspection Status</code>, <code>Base Line UTG</code>, <code>Punch Points Category Closed</code>, <code>Final System Acceptance</code>, <code>Document/Drawing</code>, <code>Remarks</code>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TASK VIEW: ADMIN & LIVE DATABASE CONSOLE IN RIGHT PANE */}
+        {viewLevel === 'admin' && (
+          <AdminPanel inline onClose={goToHome} />
         )}
       </main>
 
@@ -4420,7 +4651,7 @@ export default function Dashboard() {
         </div>
       </footer>
 
-      {/* ADMIN PANEL */}
+      {/* ADMIN PANEL MODAL (FALLBACK IF OPENED AS MODAL) */}
       {showAdminPanel && <AdminPanel onClose={() => setShowAdminPanel(false)} />}
 
       {/* DIRECT IN-PLACE EQUIPMENT EDIT MODAL */}
@@ -4431,6 +4662,7 @@ export default function Dashboard() {
           onSave={async (updatedItem) => {
             await saveEquipment(updatedItem);
           }}
+          onDelete={isAdmin ? deleteEquipment : undefined}
         />
       )}
     </>

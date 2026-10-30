@@ -19,12 +19,18 @@
 }
 
 html {
+  height: 100%;
+  overflow: hidden;
   scroll-behavior: smooth;
   scroll-padding-top: env(safe-area-inset-top, 0px);
 }
 
 body {
   margin: 0;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   background: var(--bg);
   color: var(--tx);
   font: 13.5px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -61,8 +67,8 @@ header.nrep-header {
   align-items: center;
   flex-wrap: wrap;
   padding: 10px 16px;
-  position: sticky;
-  top: 0;
+  position: relative;
+  flex-shrink: 0;
   z-index: 40;
   border-bottom: 3px solid var(--ac);
 }
@@ -251,11 +257,16 @@ header.nrep-header #hm {
   white-space: nowrap;
 }
 .l1 {
-  padding-left: 14px;
+  padding-left: 12px;
+  font-weight: 600;
 }
 .l2 {
-  padding-left: 44px;
+  padding-left: 30px;
   font-size: 12.5px;
+}
+.l3 {
+  padding-left: 48px;
+  font-size: 11.5px;
 }
 .tg {
   border: 0;
@@ -285,10 +296,14 @@ header.nrep-header #hm {
 
 /* Main Container */
 main.nrep-main {
-  padding: 16px 24px 80px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 16px 24px 20px;
   min-width: 0;
   width: 100%;
-  min-height: calc(100vh - 60px);
+  box-sizing: border-box;
 }
 .bc {
   font-size: 12px;
@@ -440,6 +455,18 @@ button.k.act {
   grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
   margin-bottom: 12px;
 }
+.g3-overview {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(225px, 0.85fr) minmax(340px, 1.65fr) minmax(255px, 1.05fr);
+  margin-bottom: 12px;
+  align-items: stretch;
+}
+@media (max-width: 960px) {
+  .g3-overview {
+    grid-template-columns: 1fr;
+  }
+}
 .cd {
   background: var(--cd);
   border: 1px solid var(--bd);
@@ -447,8 +474,10 @@ button.k.act {
   padding: 14px;
   margin-bottom: 12px;
 }
-.g2 .cd {
+.g2 .cd,
+.g3-overview .cd {
   margin: 0;
+  min-width: 0;
 }
 .cd h3 {
   margin: 0 0 12px;
@@ -471,11 +500,27 @@ button.k.act {
 }
 
 /* Ring & Progress Bars */
+.overall-status-cd {
+  display: flex;
+  flex-direction: column;
+}
+.overall-status-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 0;
+}
 .dn {
   display: flex;
   gap: 20px;
   align-items: center;
+  justify-content: center;
   flex-wrap: wrap;
+}
+.dl {
+  text-align: left;
 }
 .dl div {
   margin: 5px 0;
@@ -483,6 +528,10 @@ button.k.act {
 .dl b {
   font-size: 20px;
   margin-right: 8px;
+}
+.overall-status-body .lg {
+  justify-content: center;
+  margin-top: 14px;
 }
 .sb {
   display: flex;
@@ -687,10 +736,8 @@ th.ct {
 
 /* Footer */
 footer.nrep-footer {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  position: relative;
+  flex-shrink: 0;
   z-index: 30;
   background: var(--hd);
   color: rgba(255, 255, 255, 0.92);
@@ -729,7 +776,7 @@ footer.nrep-footer button:hover {
 
 @media (max-width: 900px) {
   main.nrep-main {
-    padding: 12px 12px 68px;
+    padding: 12px 12px 16px;
   }
   footer.nrep-footer {
     padding: 6px 12px calc(6px + env(safe-area-inset-bottom, 0px));

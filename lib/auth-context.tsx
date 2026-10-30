@@ -17,7 +17,7 @@ import {
   getDocs,
   limit,
 } from 'firebase/firestore';
-import { auth, db, googleProvider, testFirestoreConnection } from './firebase';
+import { auth, db, googleProvider, testFirestoreConnection, safeFirestoreWrite } from './firebase';
 import { UserProfile } from './types';
 
 interface AuthContextType {
@@ -113,18 +113,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           localStorage.setItem('nrep_user_profile', JSON.stringify(sanitized));
         } catch {}
 
-        if (data.firestoreRecordToSync) {
-          await setDoc(userRef, data.firestoreRecordToSync, { merge: true });
+        if (data.firestoreRecordToSync && !existingData) {
+          await safeFirestoreWrite(() =>
+            setDoc(userRef, data.firestoreRecordToSync, { merge: true })
+          );
         }
-        if (data.isBootstrapAdmin) {
-          await setDoc(
-            doc(db, 'admins', firebaseUser.uid),
-            {
-              uid: firebaseUser.uid,
-              email: firebaseUser.email,
-              assignedAt: new Date().toISOString(),
-            },
-            { merge: true }
+        if (data.isBootstrapAdmin && !existingData) {
+          await safeFirestoreWrite(() =>
+            setDoc(
+              doc(db, 'admins', firebaseUser.uid),
+              {
+                uid: firebaseUser.uid,
+                email: firebaseUser.email,
+                assignedAt: new Date().toISOString(),
+              },
+              { merge: true }
+            )
           );
         }
       }
@@ -259,20 +263,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } catch {}
     }
 
-    // Sync server-prepared record (with hashed password) to Firestore
-    if (result.firestoreRecordToSync) {
+    // Sync server-prepared record (with hashed password) to Firestore only if not already stored
+    if (result.firestoreRecordToSync && !matchedProfile) {
       const syncId = result.firestoreRecordToSync.uid || targetDocId;
       try {
-        await setDoc(doc(db, 'users', syncId), result.firestoreRecordToSync, { merge: true });
+        await safeFirestoreWrite(() =>
+          setDoc(doc(db, 'users', syncId), result.firestoreRecordToSync, { merge: true })
+        );
         if (result.isAdmin) {
-          await setDoc(
-            doc(db, 'admins', syncId),
-            {
-              uid: syncId,
-              email: result.firestoreRecordToSync.email,
-              assignedAt: new Date().toISOString(),
-            },
-            { merge: true }
+          await safeFirestoreWrite(() =>
+            setDoc(
+              doc(db, 'admins', syncId),
+              {
+                uid: syncId,
+                email: result.firestoreRecordToSync.email,
+                assignedAt: new Date().toISOString(),
+              },
+              { merge: true }
+            )
           );
         }
       } catch {}

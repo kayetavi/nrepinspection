@@ -12,12 +12,12 @@
         },
         "Unit": {
           "type": "string",
-          "description": "Parent industrial unit name (e.g. DM/CPU, Boilers & HRSG)",
+          "description": "Parent project unit name (RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB, UTILITY)",
           "maxLength": 128
         },
-        "AreaPackage": {
+        "SubUnit": {
           "type": "string",
-          "description": "Area or package subdivision within the unit",
+          "description": "Sub-unit under UTILITY (DM-CPU, N2U, CA-IA, BOILERS AND HRSG, COOLING TOWER, RWDU, RW FILTER, RW RESERVOIR)",
           "maxLength": 128
         },
         "SystemNo": {
@@ -38,11 +38,6 @@
         "EquipmentType": {
           "type": "string",
           "description": "Category or type of asset (e.g. Tank, Pump, Valve, Exchanger)",
-          "maxLength": 128
-        },
-        "RFINo": {
-          "type": "string",
-          "description": "Request for inspection number",
           "maxLength": 128
         },
         "FormatIStatus": {
@@ -75,20 +70,15 @@
           "description": "Format-III milestone clearance date (YYYY-MM-DD)",
           "maxLength": 64
         },
-        "CategoryAStatus": {
-          "type": "string",
-          "description": "Category-A punch point status (Open / Closed / Pending)",
-          "maxLength": 64
-        },
         "InternalInspectionStatus": {
           "type": "string",
           "description": "Internal inspection verification milestone status",
           "maxLength": 64
         },
-        "MediaFillingClearance": {
+        "BaseLineUTG": {
           "type": "string",
-          "description": "Media filling clearance milestone status",
-          "maxLength": 64
+          "description": "Base Line UTG inspection status or thickness measurement",
+          "maxLength": 128
         },
         "PunchPointsCategoryClosed": {
           "type": "string",
@@ -100,24 +90,14 @@
           "description": "Final system acceptance signoff status",
           "maxLength": 64
         },
-        "LastInspectionDate": {
+        "DocumentDrawing": {
           "type": "string",
-          "description": "Most recent inspection activity date (YYYY-MM-DD)",
-          "maxLength": 64
-        },
-        "ResponsibleAgency": {
-          "type": "string",
-          "description": "Contractor, vendor, or engineer agency responsible for item",
-          "maxLength": 200
+          "description": "Engineering Document or Drawing number / reference link",
+          "maxLength": 1000
         },
         "Remarks": {
           "type": "string",
           "description": "Engineer notes and field observations",
-          "maxLength": 1000
-        },
-        "Link": {
-          "type": "string",
-          "description": "Document URL or cloud link to inspection sheets",
           "maxLength": 1000
         },
         "updatedBy": {
