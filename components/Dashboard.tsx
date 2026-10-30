@@ -26,6 +26,8 @@ import {
   TrendingUp,
   Calendar,
   Check,
+  Search,
+  X,
 } from 'lucide-react';
 
 type ViewLevel = 'p' | 'u' | 's' | 'e';
@@ -67,7 +69,9 @@ export default function Dashboard() {
   // Global search & drop-down
   const [globalSearch, setGlobalSearch] = useState('');
   const [showGlobalResults, setShowGlobalResults] = useState(false);
+  const [searchBoxOpen, setSearchBoxOpen] = useState(false);
   const searchContainerRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   // In-place direct equipment editing & Modals
   const [editingEquipment, setEditingEquipment] = useState<EquipmentItem | null>(null);
@@ -212,11 +216,14 @@ export default function Dashboard() {
     return () => window.removeEventListener('hashchange', handleHash);
   }, [treeData, equipment]);
 
-  // Click outside to close search dropdown
+  // Click outside to close search dropdown and collapse empty search box
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (searchContainerRef.current && !searchContainerRef.current.contains(e.target as Node)) {
         setShowGlobalResults(false);
+        if (!searchInputRef.current?.value.trim()) {
+          setSearchBoxOpen(false);
+        }
       }
     };
     document.addEventListener('click', handleClickOutside);
@@ -1970,20 +1977,86 @@ export default function Dashboard() {
           </small>
         </h1>
 
-        {/* Search input with drop-down */}
+        {/* Compact Search Icon -> Opens Compact Search Input on Click */}
         <div className="gs" ref={searchContainerRef}>
-          <input
-            id="gs"
-            placeholder="🔍 Search tag, equipment, system, unit…"
-            value={globalSearch}
-            onChange={(e) => {
-              setGlobalSearch(e.target.value);
-              setShowGlobalResults(true);
-            }}
-            onFocus={() => setShowGlobalResults(true)}
-            autoComplete="off"
-          />
-          {showGlobalResults && globalSearchResults && (
+          {!searchBoxOpen ? (
+            <button
+              type="button"
+              id="gs-btn"
+              title="Search tag, equipment, system, unit"
+              aria-label="Open search"
+              onClick={() => {
+                setSearchBoxOpen(true);
+                setTimeout(() => searchInputRef.current?.focus(), 20);
+              }}
+              style={{
+                padding: '6px 9px',
+                height: '30px',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderRadius: '5px',
+              }}
+            >
+              <Search size={15} />
+            </button>
+          ) : (
+            <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+              <Search
+                size={13}
+                style={{
+                  position: 'absolute',
+                  left: '9px',
+                  color: 'rgba(255, 255, 255, 0.7)',
+                  pointerEvents: 'none',
+                }}
+              />
+              <input
+                ref={searchInputRef}
+                id="gs"
+                placeholder="Search tag, unit…"
+                value={globalSearch}
+                onChange={(e) => {
+                  setGlobalSearch(e.target.value);
+                  setShowGlobalResults(true);
+                }}
+                onFocus={() => setShowGlobalResults(true)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    setGlobalSearch('');
+                    setShowGlobalResults(false);
+                    setSearchBoxOpen(false);
+                  }
+                }}
+                autoComplete="off"
+              />
+              <button
+                type="button"
+                title="Close search"
+                aria-label="Close search"
+                onClick={() => {
+                  setGlobalSearch('');
+                  setShowGlobalResults(false);
+                  setSearchBoxOpen(false);
+                }}
+                style={{
+                  position: 'absolute',
+                  right: '4px',
+                  border: 'none',
+                  background: 'transparent',
+                  padding: '2px 4px',
+                  color: 'rgba(255, 255, 255, 0.75)',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <X size={13} />
+              </button>
+            </div>
+          )}
+
+          {searchBoxOpen && showGlobalResults && globalSearchResults && (
             <div id="gr" className="show">
               {globalSearchResults.matchedUnits.length > 0 && (
                 <>
@@ -1995,6 +2068,7 @@ export default function Dashboard() {
                       onClick={() => {
                         setShowGlobalResults(false);
                         setGlobalSearch('');
+                        setSearchBoxOpen(false);
                       }}
                     >
                       {u.name}
@@ -2013,6 +2087,7 @@ export default function Dashboard() {
                       onClick={() => {
                         setShowGlobalResults(false);
                         setGlobalSearch('');
+                        setSearchBoxOpen(false);
                       }}
                     >
                       {s.name}
@@ -2032,6 +2107,7 @@ export default function Dashboard() {
                       onClick={() => {
                         setShowGlobalResults(false);
                         setGlobalSearch('');
+                        setSearchBoxOpen(false);
                       }}
                     >
                       <b>{eq.EquipmentTagNo}</b> {eq.EquipmentDescription}
@@ -3978,21 +4054,21 @@ export default function Dashboard() {
                                       title="Edit equipment record"
                                       onClick={() => setEditingEquipment(r)}
                                     >
-                                      ✏️ Edit
-                                    </button>
-                                  </td>
-                                )}
-                              </tr>
-                            );
-                          })}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            </div>
-          </>
-        )}
+                  Edit
+                </button>
+              </td>
+            )}
+          </tr>
+        );
+      })}
+  </tbody>
+</table>
+</div>
+)}
+</div>
+</div>
+</>
+)}
 
         {/* LEVEL 4: EQUIPMENT DETAIL (MATCHING REFERENCE pageE()) */}
         {viewLevel === 'e' && activeEquipment && (
@@ -4025,7 +4101,7 @@ export default function Dashboard() {
                   }}
                   onClick={() => setEditingEquipment(activeEquipment)}
                 >
-                  ✏️ Edit Equipment Details
+                  Edit Equipment Details
                 </button>
               )}
             </div>
@@ -4046,9 +4122,7 @@ export default function Dashboard() {
 
                   return (
                     <div key={col.key} className={`st ${borderCls}`}>
-                      <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}>
-                        {col.short} {isEditor && <span title="Editable stage" style={{ fontSize: '10px' }}>✏️</span>}
-                      </span>
+                      <span>{col.short}</span>
                       {isEditor ? (
                         <select
                           value={val}
@@ -4097,33 +4171,10 @@ export default function Dashboard() {
 
             {/* Details Grid */}
             <div className="cd">
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px', flexWrap: 'wrap', gap: '8px' }}>
-                <h3 style={{ margin: 0 }}>Details</h3>
-                {isEditor && (
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: '4px',
-                      background: '#f0f7ff',
-                      color: '#0284c7',
-                      borderColor: '#bae6fd',
-                      fontSize: '12px',
-                      padding: '4px 10px',
-                      borderRadius: '4px',
-                      cursor: 'pointer',
-                    }}
-                    onClick={() => setEditingEquipment(activeEquipment)}
-                  >
-                    ✏️ Quick Edit All Fields
-                  </button>
-                )}
-              </div>
+              <h3>Details</h3>
               <div className="dg">
                 <div>
-                  <label>RFI No. {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>RFI No.</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4139,7 +4190,7 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Area / Package {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>Area / Package</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4155,7 +4206,7 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Format-I date {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>Format-I date</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4171,7 +4222,7 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Format-II date {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>Format-II date</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4187,7 +4238,7 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Format-III date {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>Format-III date</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4203,7 +4254,7 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Punch points category closed {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>Punch points category closed</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4221,7 +4272,7 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Last inspection {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>Last inspection</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4237,7 +4288,7 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Responsible agency / person {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>Responsible agency / person</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4253,7 +4304,7 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Remarks {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>Remarks</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4269,7 +4320,7 @@ export default function Dashboard() {
                 </div>
 
                 <div>
-                  <label>Document link (URL) {isEditor && <span style={{ fontSize: '11px', color: '#0284c7' }}>✏️</span>}</label>
+                  <label>Document link (URL)</label>
                   <div>
                     {isEditor ? (
                       <input
@@ -4291,7 +4342,7 @@ export default function Dashboard() {
                     Open linked document ↗
                   </a>
                 ) : (
-                  <span className="note">No link yet. Click ✏️ Edit or enter link above.</span>
+                  <span className="note">No link yet.</span>
                 )}
               </p>
             </div>
