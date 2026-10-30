@@ -1,0 +1,8 @@
+{
+  "name": "NREP Inspection & Acceptance Cloud Monitor",
+  "description": "Industrial inspection and system acceptance tracking system with real-time Firebase synchronization, role-based access control, Excel upload/export, and administrative user moderation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

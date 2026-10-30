@@ -1,0 +1,262 @@
+{
+  "entities": {
+    "Equipment": {
+      "title": "Equipment",
+      "description": "Industrial inspection and system acceptance record for plant units and packages",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier of equipment record",
+          "maxLength": 128
+        },
+        "Unit": {
+          "type": "string",
+          "description": "Parent industrial unit name (e.g. DM/CPU, Boilers & HRSG)",
+          "maxLength": 128
+        },
+        "AreaPackage": {
+          "type": "string",
+          "description": "Area or package subdivision within the unit",
+          "maxLength": 128
+        },
+        "SystemNo": {
+          "type": "string",
+          "description": "System number and classification",
+          "maxLength": 200
+        },
+        "EquipmentTagNo": {
+          "type": "string",
+          "description": "Unique engineering equipment tag number",
+          "maxLength": 128
+        },
+        "EquipmentDescription": {
+          "type": "string",
+          "description": "Detailed description of the equipment or asset",
+          "maxLength": 500
+        },
+        "EquipmentType": {
+          "type": "string",
+          "description": "Category or type of asset (e.g. Tank, Pump, Valve, Exchanger)",
+          "maxLength": 128
+        },
+        "RFINo": {
+          "type": "string",
+          "description": "Request for inspection number",
+          "maxLength": 128
+        },
+        "FormatIStatus": {
+          "type": "string",
+          "description": "Format-I inspection clearance status",
+          "maxLength": 64
+        },
+        "FormatIDate": {
+          "type": "string",
+          "description": "Format-I milestone clearance date (YYYY-MM-DD)",
+          "maxLength": 64
+        },
+        "FormatIIStatus": {
+          "type": "string",
+          "description": "Format-II inspection clearance status",
+          "maxLength": 64
+        },
+        "FormatIIDate": {
+          "type": "string",
+          "description": "Format-II milestone clearance date (YYYY-MM-DD)",
+          "maxLength": 64
+        },
+        "FormatIIIStatus": {
+          "type": "string",
+          "description": "Format-III inspection clearance status",
+          "maxLength": 64
+        },
+        "FormatIIIDate": {
+          "type": "string",
+          "description": "Format-III milestone clearance date (YYYY-MM-DD)",
+          "maxLength": 64
+        },
+        "CategoryAStatus": {
+          "type": "string",
+          "description": "Category-A punch point status (Open / Closed / Pending)",
+          "maxLength": 64
+        },
+        "InternalInspectionStatus": {
+          "type": "string",
+          "description": "Internal inspection verification milestone status",
+          "maxLength": 64
+        },
+        "MediaFillingClearance": {
+          "type": "string",
+          "description": "Media filling clearance milestone status",
+          "maxLength": 64
+        },
+        "PunchPointsCategoryClosed": {
+          "type": "string",
+          "description": "Punch point closure category code",
+          "maxLength": 64
+        },
+        "FinalSystemAcceptance": {
+          "type": "string",
+          "description": "Final system acceptance signoff status",
+          "maxLength": 64
+        },
+        "LastInspectionDate": {
+          "type": "string",
+          "description": "Most recent inspection activity date (YYYY-MM-DD)",
+          "maxLength": 64
+        },
+        "ResponsibleAgency": {
+          "type": "string",
+          "description": "Contractor, vendor, or engineer agency responsible for item",
+          "maxLength": 200
+        },
+        "Remarks": {
+          "type": "string",
+          "description": "Engineer notes and field observations",
+          "maxLength": 1000
+        },
+        "Link": {
+          "type": "string",
+          "description": "Document URL or cloud link to inspection sheets",
+          "maxLength": 1000
+        },
+        "updatedBy": {
+          "type": "string",
+          "description": "User email or identifier who last modified the record",
+          "maxLength": 200
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last update",
+          "maxLength": 64
+        }
+      },
+      "required": ["EquipmentTagNo", "Unit", "SystemNo"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile with role-based access control and moderation status",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "User Firebase Authentication UID",
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "description": "User email address",
+          "maxLength": 200
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name",
+          "maxLength": 200
+        },
+        "role": {
+          "type": "string",
+          "description": "Role: admin, editor, or viewer",
+          "enum": ["admin", "editor", "viewer"]
+        },
+        "status": {
+          "type": "string",
+          "description": "Access moderation status: approved, pending, suspended",
+          "enum": ["approved", "pending", "suspended"]
+        },
+        "assignedUnits": {
+          "type": "string",
+          "description": "Units this user has dedicated jurisdiction over or All",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of user creation",
+          "maxLength": 64
+        },
+        "lastLoginAt": {
+          "type": "string",
+          "description": "ISO timestamp of last login",
+          "maxLength": 64
+        }
+      },
+      "required": ["uid", "email", "role", "status"]
+    },
+    "AdminConfig": {
+      "title": "AdminConfig",
+      "description": "System moderation settings and bootstrap configuration",
+      "type": "object",
+      "properties": {
+        "defaultUserRole": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "requireApproval": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "updatedAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      }
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Audit trail of data mutations and administrative actions",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "action": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "target": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "userEmail": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "timestamp": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "details": {
+          "type": "string",
+          "maxLength": 1000
+        }
+      },
+      "required": ["action", "userEmail", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/equipment/{equipmentId}": {
+      "schema": {
+        "$ref": "Equipment"
+      },
+      "description": "Inspection and milestone status records for plant equipment"
+    },
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "UserProfile"
+      },
+      "description": "User profiles with role permissions and moderation approval state"
+    },
+    "/admins/{userId}": {
+      "schema": {
+        "$ref": "UserProfile"
+      },
+      "description": "Authoritative admin lookup documents for security rules validation"
+    },
+    "/audit_logs/{logId}": {
+      "schema": {
+        "$ref": "AuditLog"
+      },
+      "description": "Activity logs for data changes, batch uploads, and permission modifications"
+    }
+  }
+}
