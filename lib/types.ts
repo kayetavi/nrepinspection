@@ -3,6 +3,7 @@ export interface EquipmentItem {
   Unit: string;
   SubUnit?: string;
   SystemNo: string;
+  SubSystem?: string;
   EquipmentTagNo: string;
   EquipmentDescription?: string;
   EquipmentType?: string;
@@ -12,9 +13,13 @@ export interface EquipmentItem {
   FormatIIDate?: string;
   FormatIIIStatus?: string;
   FormatIIIDate?: string;
+  FormatIVStatus?: string;
+  FormatIVDate?: string;
+  FormatVStatus?: string;
+  FormatVDate?: string;
   InternalInspectionStatus?: string;
   BaseLineUTG?: string;
-  PunchPointsCategoryClosed?: string;
+  PMI?: string;
   FinalSystemAcceptance?: string;
   DocumentDrawing?: string;
   Remarks?: string;
@@ -30,8 +35,120 @@ export interface EquipmentItem {
   updatedAt?: string;
 }
 
-export type UserRole = 'admin' | 'editor' | 'viewer';
+export type HierarchyLevelType = 'unit' | 'subunit' | 'system' | 'subsystem';
+
+export interface HierarchyStep {
+  level: HierarchyLevelType;
+  label: string;
+  value: string;
+}
+
+/**
+ * Cleans a raw hierarchy field (Sub-Unit, System, or Sub-System).
+ * Returns '' if the field is blank or a legacy auto-placeholder (e.g. "System not assigned", "RPTU Main System"),
+ * allowing the hierarchy engine to automatically skip blank levels to the previous parent level.
+ */
+export function cleanHierarchyField(raw?: string | null, unitName?: string): string {
+  if (!raw) return '';
+  const trimmed = String(raw).trim();
+  if (!trimmed) return '';
+  const lc = trimmed.toLowerCase();
+  if (
+    lc === '—' ||
+    lc === '-' ||
+    lc === 'n/a' ||
+    lc === 'na' ||
+    lc === 'none' ||
+    lc === 'null' ||
+    lc === 'undefined' ||
+    lc === 'unassigned' ||
+    lc === 'system not assigned' ||
+    lc === 'sub-unit not assigned' ||
+    lc === 'sub-system not assigned' ||
+    lc === 'subsystem not assigned' ||
+    lc === 'main system' ||
+    lc.endsWith(' main system')
+  ) {
+    return '';
+  }
+  if (unitName && lc === `${unitName.trim().toLowerCase()} main system`) {
+    return '';
+  }
+  return trimmed;
+}
+
+/**
+ * Returns the ordered chain of non-empty hierarchy levels for an equipment item:
+ * Unit -> [Sub-Unit] -> [System] -> [Sub-System].
+ * Any level left blank is automatically skipped.
+ */
+export function getEquipmentHierarchyChain(
+  item: Pick<EquipmentItem, 'Unit' | 'SubUnit' | 'SystemNo' | 'SubSystem'>
+): HierarchyStep[] {
+  const unitVal = (item.Unit || '').trim() || 'RPTU';
+  const chain: HierarchyStep[] = [{ level: 'unit', label: 'Unit', value: unitVal }];
+
+  const subUnitVal = cleanHierarchyField(item.SubUnit, unitVal);
+  if (subUnitVal) {
+    chain.push({ level: 'subunit', label: 'Sub-Unit', value: subUnitVal });
+  }
+
+  const systemVal = cleanHierarchyField(item.SystemNo, unitVal);
+  if (systemVal && systemVal.toUpperCase() !== subUnitVal.toUpperCase()) {
+    chain.push({ level: 'system', label: 'System', value: systemVal });
+  }
+
+  const subSystemVal = cleanHierarchyField(item.SubSystem, unitVal);
+  if (
+    subSystemVal &&
+    subSystemVal.toUpperCase() !== systemVal.toUpperCase() &&
+    subSystemVal.toUpperCase() !== subUnitVal.toUpperCase()
+  ) {
+    chain.push({ level: 'subsystem', label: 'Sub-System', value: subSystemVal });
+  }
+
+  return chain;
+}
+
+/**
+ * Formats the hierarchy path string (e.g. "MSP › NHT › SYS-01 › SUB-01" or simply "RPTU" if Sub-Unit/System/Sub-System are blank).
+ */
+export function formatEquipmentHierarchyPath(
+  item: Pick<EquipmentItem, 'Unit' | 'SubUnit' | 'SystemNo' | 'SubSystem'>,
+  separator = ' › '
+): string {
+  return getEquipmentHierarchyChain(item)
+    .map((s) => s.value)
+    .join(separator);
+}
+
+export type UserRole =
+  | 'admin'
+  | 'lead_engineer'
+  | 'engineer'
+  | 'inspector'
+  | 'editor'
+  | 'viewer';
 export type UserStatus = 'approved' | 'pending' | 'suspended';
+
+export const VALID_USER_ROLES: UserRole[] = [
+  'admin',
+  'lead_engineer',
+  'engineer',
+  'inspector',
+  'editor',
+  'viewer',
+];
+
+export function isWriteCapableRole(role?: string | null): boolean {
+  return (
+    role === 'admin' ||
+    role === 'lead_engineer' ||
+    role === 'engineer' ||
+    role === 'inspector' ||
+    role === 'editor'
+  );
+}
 
 export interface UserProfile {
   uid: string;
@@ -54,16 +171,176 @@ export interface AuditLogItem {
   details?: string;
 }
 
-// 7 Revised Top-Level Project Units
-export const UNITS = [
+export interface ProjectUnitsConfig {
+  units: string[];
+  utilitySubUnits: string[];
+  mspSubUnits: string[];
+  updatedBy?: string;
+  updatedAt?: string;
+}
+
+// Top-Level Project Units (Dynamically synchronized from Supabase Server _system/units_config.json)
+export const UNITS: string[] = [
   'RPTU',
   'MSP',
   'PFCCU',
   'CDU/VDU',
   'DHDT',
   'SRB',
+  'DCU Rev',
   'UTILITY',
 ];
+
+/**
+ * Synchronizes the in-memory UNITS, UTILITY_SUB_UNITS, and MSP_SUB_UNITS arrays
+ * with the authoritative configuration fetched from Supabase Server.
+ */
+export function applyDynamicUnitsConfig(config?: Partial<ProjectUnitsConfig> | null): void {
+  if (!config) return;
+  if (Array.isArray(config.units) && config.units.length > 0) {
+    const cleanUnits = Array.from(
+      new Set(config.units.map((u) => String(u || '').trim()).filter(Boolean))
+    );
+    if (cleanUnits.length > 0) {
+      UNITS.splice(0, UNITS.length, ...cleanUnits);
+    }
+  }
+  if (Array.isArray(config.utilitySubUnits) && config.utilitySubUnits.length > 0) {
+    const cleanUtil = Array.from(
+      new Set(config.utilitySubUnits.map((u) => String(u || '').trim()).filter(Boolean))
+    );
+    if (cleanUtil.length > 0) {
+      UTILITY_SUB_UNITS.splice(0, UTILITY_SUB_UNITS.length, ...cleanUtil);
+    }
+  }
+  if (Array.isArray(config.mspSubUnits) && config.mspSubUnits.length > 0) {
+    const cleanMsp = Array.from(
+      new Set(config.mspSubUnits.map((u) => String(u || '').trim()).filter(Boolean))
+    );
+    if (cleanMsp.length > 0) {
+      MSP_SUB_UNITS.splice(0, MSP_SUB_UNITS.length, ...cleanMsp);
+    }
+  }
+}
+
+/**
+ * Returns true if the assignedUnits string represents unrestricted access to all project units.
+ */
+export function isAllUnitsScope(assignedUnits?: string | null): boolean {
+  if (!assignedUnits) return true;
+  const normalized = assignedUnits.trim().toLowerCase();
+  return normalized === '' || normalized === 'all' || normalized === 'all units';
+}
+
+/**
+ * Resolves the canonical list of top-level UNITS that a user profile is scoped to view/manage.
+ */
+export function getUserAllowedUnits(profile?: UserProfile | null): string[] {
+  if (!profile || isAllUnitsScope(profile.assignedUnits)) {
+    return [...UNITS];
+  }
+  const raw = (profile.assignedUnits || '').trim();
+  const tokens = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const matched = new Set<string>();
+  tokens.forEach((token) => {
+    const upper = token.toUpperCase();
+    const exactUnit = UNITS.find((u) => u.toUpperCase() === upper);
+    if (exactUnit) {
+      matched.add(exactUnit);
+    } else if (upper === 'CDU' || upper === 'VDU' || upper === 'CDU-VDU') {
+      matched.add('CDU/VDU');
+    } else if (upper === 'DCU REV' || upper === 'DCU' || upper === 'DCUREV' || upper === 'DCU-REV') {
+      matched.add('DCU Rev');
+    } else if (MSP_SUB_UNITS.some((su) => su.toUpperCase() === upper)) {
+      matched.add('MSP');
+    } else if (UTILITY_SUB_UNITS.some((su) => su.toUpperCase() === upper)) {
+      matched.add('UTILITY');
+    } else {
+      // Allow any custom dynamic unit assigned to the user
+      matched.add(token);
+    }
+  });
+
+  if (matched.size === 0) return [...UNITS];
+  const ordered = UNITS.filter((u) => matched.has(u));
+  matched.forEach((m) => {
+    if (!ordered.some((o) => o.toUpperCase() === m.toUpperCase())) {
+      ordered.push(m);
+    }
+  });
+  return ordered;
+}
+
+export type ReportProvider =
+  | 'google_drive'
+  | 'onedrive'
+  | 'supabase_storage'
+  | 'external_link';
+
+export type ReportStageKey =
+  | 'FormatIStatus'
+  | 'FormatIIStatus'
+  | 'FormatIIIStatus'
+  | 'FormatIVStatus'
+  | 'FormatVStatus'
+  | 'InternalInspectionStatus'
+  | 'BaseLineUTG'
+  | 'PMI'
+  | 'FinalSystemAcceptance'
+  | 'General';
+
+export interface InspectionReportAttachment {
+  id: string;
+  title: string;
+  stage: ReportStageKey;
+  stageLabel: string;
+  provider: ReportProvider;
+  viewUrl: string;
+  embedUrl: string;
+  fileId?: string;
+  onedriveItemId?: string;
+  secondaryProvider?: ReportProvider;
+  secondaryViewUrl?: string;
+  secondaryEmbedUrl?: string;
+  storagePath?: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  uploadedBy: string;
+  uploadedAt: string;
+}
+
+/**
+ * Checks whether a user profile is authorized to access/modify a given equipment Unit.
+ */
+export function canUserAccessUnit(
+  profile?: UserProfile | null,
+  unit?: string | null
+): boolean {
+  if (!profile || isAllUnitsScope(profile.assignedUnits)) {
+    return true;
+  }
+  if (!unit) return true;
+  const allowedSet = new Set(getUserAllowedUnits(profile).map((u) => u.toUpperCase()));
+  return allowedSet.has(unit.trim().toUpperCase());
+}
+
+/**
+ * Filters an equipment array according to the user's assigned unit scope.
+ */
+export function filterEquipmentByUserScope(
+  items: EquipmentItem[],
+  profile?: UserProfile | null
+): EquipmentItem[] {
+  if (!profile || isAllUnitsScope(profile.assignedUnits)) {
+    return items;
+  }
+  const allowedSet = new Set(getUserAllowedUnits(profile).map((u) => u.toUpperCase()));
+  return items.filter((item) => allowedSet.has((item.Unit || '').trim().toUpperCase()));
+}
 
 // 8 Sub-Units inside UTILITY (Equipment under UTILITY resides inside these sub-units)
 export const UTILITY_SUB_UNITS = [
@@ -76,6 +353,36 @@ export const UTILITY_SUB_UNITS = [
   'RW FILTER',
   'RW RESERVOIR',
 ];
+
+// 3 Sub-Units inside MSP (Equipment under MSP resides inside NHT, CCR, ISOM)
+export const MSP_SUB_UNITS = [
+  'NHT',
+  'CCR',
+  'ISOM',
+];
+
+/**
+ * Resolves any raw sub-unit / package string into one of the canonical MSP_SUB_UNITS
+ */
+export function resolveMspSubUnit(raw?: string): string | null {
+  if (!raw) return null;
+  const s = raw.trim().toUpperCase();
+  if (!s) return null;
+
+  if (MSP_SUB_UNITS.includes(s)) return s;
+
+  if (s.includes('NHT') || s.includes('NAPHTHA')) {
+    return 'NHT';
+  }
+  if (s.includes('CCR') || s.includes('REFORM')) {
+    return 'CCR';
+  }
+  if (s.includes('ISOM') || s.includes('ISOMER')) {
+    return 'ISOM';
+  }
+
+  return null;
+}
 
 /**
  * Resolves any raw sub-unit / legacy unit string into one of the 8 canonical UTILITY_SUB_UNITS
@@ -156,6 +463,22 @@ export const STATUS_COLUMNS: StatusColumnConfig[] = [
     pendingValue: 'Not Issued',
   },
   {
+    key: 'FormatIVStatus',
+    label: 'Format-IV Status',
+    short: 'Format-IV',
+    options: ['Issued', 'Not Issued'],
+    doneValue: 'Issued',
+    pendingValue: 'Not Issued',
+  },
+  {
+    key: 'FormatVStatus',
+    label: 'Format-V Status',
+    short: 'Format-V',
+    options: ['Issued', 'Not Issued'],
+    doneValue: 'Issued',
+    pendingValue: 'Not Issued',
+  },
+  {
     key: 'InternalInspectionStatus',
     label: 'Internal Inspection Status',
     short: 'Internal Insp.',
@@ -172,17 +495,34 @@ export const STATUS_COLUMNS: StatusColumnConfig[] = [
     pendingValue: 'No',
   },
   {
+    key: 'PMI',
+    label: 'PMI',
+    short: 'PMI',
+    options: ['Yes', 'No'],
+    doneValue: 'Yes',
+    pendingValue: 'No',
+  },
+  {
     key: 'FinalSystemAcceptance',
     label: 'Final System Acceptance',
     short: 'Final Accept.',
-    options: ['Accept', 'Not accept'],
-    doneValue: 'Accept',
-    pendingValue: 'Not accept',
+    options: ['Accepted', 'Not Accepted'],
+    doneValue: 'Accepted',
+    pendingValue: 'Not Accepted',
   },
 ];
 
+// Core inspection stages considered for percentage & completion status calculation
+// (Excludes Base Line UTG, PMI, and Internal Inspection as requested)
+export const PROGRESS_STAGE_COLUMNS: StatusColumnConfig[] = STATUS_COLUMNS.filter(
+  (col) =>
+    col.key !== 'BaseLineUTG' &&
+    col.key !== 'PMI' &&
+    col.key !== 'InternalInspectionStatus'
+);
+
 // Fallback generic list for legacy imports if needed
-export const STATUS_OPTIONS = ['Issued', 'Not Issued', 'Yes', 'No', 'Accept', 'Not accept'];
+export const STATUS_OPTIONS = ['Issued', 'Not Issued', 'Yes', 'No', 'Accepted', 'Not Accepted'];
 
 export function getStageOptions(colKey: keyof EquipmentItem): [string, string] {
   const found = STATUS_COLUMNS.find((c) => c.key === colKey);
@@ -204,9 +544,9 @@ const POSITIVE_STAGE_KEYWORDS = new Set([
 
 /**
  * Normalizes any raw stage status string into the exact allowed dropdown option for that column:
- * - FormatIStatus, FormatIIStatus, FormatIIIStatus -> 'Issued' | 'Not Issued'
- * - InternalInspectionStatus, BaseLineUTG -> 'Yes' | 'No'
- * - FinalSystemAcceptance -> 'Accept' | 'Not accept'
+ * - FormatIStatus, FormatIIStatus, FormatIIIStatus, FormatIVStatus, FormatVStatus -> 'Issued' | 'Not Issued'
+ * - InternalInspectionStatus, BaseLineUTG, PMI -> 'Yes' | 'No'
+ * - FinalSystemAcceptance -> 'Accepted' | 'Not Accepted'
  */
 export function normalizeStageValue(colKey: keyof EquipmentItem, raw?: string): string {
   const lc = (raw || '').trim().toLowerCase();
@@ -215,14 +555,20 @@ export function normalizeStageValue(colKey: keyof EquipmentItem, raw?: string): 
     (!lc.startsWith('not ') &&
       (lc.includes('completed') || lc.includes('accepted') || lc === 'issued' || lc === 'yes'));
 
-  if (colKey === 'FormatIStatus' || colKey === 'FormatIIStatus' || colKey === 'FormatIIIStatus') {
+  if (
+    colKey === 'FormatIStatus' ||
+    colKey === 'FormatIIStatus' ||
+    colKey === 'FormatIIIStatus' ||
+    colKey === 'FormatIVStatus' ||
+    colKey === 'FormatVStatus'
+  ) {
     return isPositive ? 'Issued' : 'Not Issued';
   }
-  if (colKey === 'InternalInspectionStatus' || colKey === 'BaseLineUTG') {
+  if (colKey === 'InternalInspectionStatus' || colKey === 'BaseLineUTG' || colKey === 'PMI') {
     return isPositive ? 'Yes' : 'No';
   }
   if (colKey === 'FinalSystemAcceptance') {
-    return isPositive ? 'Accept' : 'Not accept';
+    return isPositive ? 'Accepted' : 'Not Accepted';
   }
   return raw || '';
 }
@@ -259,10 +605,9 @@ export function isInProgress(status?: string): boolean {
 }
 
 /**
- * Normalizes any equipment record (from Firestore, Excel, or legacy state)
- * so its Unit is one of the 7 canonical UNITS, if Unit === 'UTILITY'
- * its SubUnit is one of the 8 canonical UTILITY_SUB_UNITS, and all 6 stage
- * columns use their exact dropdown values.
+ * Normalizes any equipment record (from Supabase or Excel).
+ * Supports 4-level dynamic hierarchy: Unit -> Sub-Unit -> System -> Sub-System -> Equipment.
+ * Any level left blank stays '' so that blank levels automatically skip to the previous parent level.
  */
 export function normalizeEquipmentRecord(
   item: Partial<EquipmentItem> & { id?: string; EquipmentTagNo?: string }
@@ -273,10 +618,9 @@ export function normalizeEquipmentRecord(
   const rawUnit = (item.Unit || '').trim();
   const upperUnit = rawUnit.toUpperCase();
 
-  let canonicalUnit = 'UTILITY';
-  let canonicalSubUnit = '';
+  let canonicalUnit = 'RPTU';
+  let inferredSubFromUnit = '';
 
-  // Check if rawUnit directly matches one of the 6 main process units
   if (upperUnit === 'RPTU') {
     canonicalUnit = 'RPTU';
   } else if (upperUnit === 'MSP' || upperUnit === 'MS BLOCK' || upperUnit === 'MS PLANT') {
@@ -289,46 +633,92 @@ export function normalizeEquipmentRecord(
     canonicalUnit = 'DHDT';
   } else if (upperUnit === 'SRB' || upperUnit === 'SRU') {
     canonicalUnit = 'SRB';
+  } else if (upperUnit === 'DCU REV' || upperUnit === 'DCU' || upperUnit === 'DCUREV' || upperUnit === 'DCU-REV') {
+    canonicalUnit = 'DCU Rev';
   } else if (upperUnit === 'UTILITY' || upperUnit === 'UTILITIES') {
     canonicalUnit = 'UTILITY';
-    canonicalSubUnit =
-      resolveUtilitySubUnit(item.SubUnit) ||
-      resolveUtilitySubUnit(item.AreaPackage) ||
-      resolveUtilitySubUnit(item.SystemNo) ||
-      'DM-CPU';
   } else {
-    const fromLegacyUnit = resolveUtilitySubUnit(rawUnit);
-    if (fromLegacyUnit) {
+    const fromLegacyUtility = resolveUtilitySubUnit(rawUnit);
+    const fromLegacyMsp = resolveMspSubUnit(rawUnit);
+    if (fromLegacyUtility) {
       canonicalUnit = 'UTILITY';
-      canonicalSubUnit = fromLegacyUnit;
-    } else if (UNITS.includes(rawUnit)) {
-      canonicalUnit = rawUnit;
+      inferredSubFromUnit = fromLegacyUtility;
+    } else if (fromLegacyMsp) {
+      canonicalUnit = 'MSP';
+      inferredSubFromUnit = fromLegacyMsp;
     } else {
-      const inferredSub =
-        resolveUtilitySubUnit(item.SubUnit) ||
-        resolveUtilitySubUnit(item.AreaPackage) ||
-        resolveUtilitySubUnit(item.SystemNo);
-      if (inferredSub) {
-        canonicalUnit = 'UTILITY';
-        canonicalSubUnit = inferredSub;
+      const matchedCanonical = UNITS.find((u) => u.toUpperCase() === upperUnit);
+      if (matchedCanonical) {
+        canonicalUnit = matchedCanonical;
       } else {
-        canonicalUnit = rawUnit || 'RPTU';
+        canonicalUnit = rawUnit || UNITS[0] || 'RPTU';
       }
     }
   }
 
+  // Clean Sub-Unit: only populate if provided (or inferred from legacy Unit/System), never force a default when left blank
+  const cleanedRawSub =
+    cleanHierarchyField(item.SubUnit, canonicalUnit) ||
+    cleanHierarchyField(item.AreaPackage, canonicalUnit) ||
+    inferredSubFromUnit;
+
+  let canonicalSubUnit = '';
+  if (cleanedRawSub) {
+    if (canonicalUnit === 'UTILITY') {
+      canonicalSubUnit = resolveUtilitySubUnit(cleanedRawSub) || cleanedRawSub;
+    } else if (canonicalUnit === 'MSP') {
+      canonicalSubUnit = resolveMspSubUnit(cleanedRawSub) || cleanedRawSub;
+    } else {
+      canonicalSubUnit = cleanedRawSub;
+    }
+  } else if (canonicalUnit === 'UTILITY' && item.SystemNo && resolveUtilitySubUnit(item.SystemNo)) {
+    canonicalSubUnit = resolveUtilitySubUnit(item.SystemNo) || '';
+  } else if (canonicalUnit === 'MSP' && item.SystemNo && resolveMspSubUnit(item.SystemNo)) {
+    canonicalSubUnit = resolveMspSubUnit(item.SystemNo) || '';
+  }
+
+  // Clean SystemNo: keep '' if blank or if it was a placeholder or auto-duplicated from SubUnit
+  const cleanedRawSys = cleanHierarchyField(item.SystemNo, canonicalUnit);
   const systemNo =
-    canonicalUnit === 'UTILITY'
-      ? item.SystemNo && !resolveUtilitySubUnit(item.SystemNo)
-        ? item.SystemNo
-        : canonicalSubUnit
-      : item.SystemNo || `${canonicalUnit} Main System`;
+    cleanedRawSys && cleanedRawSys.toUpperCase() !== canonicalSubUnit.toUpperCase()
+      ? cleanedRawSys
+      : '';
+
+  // Clean SubSystem: read from item.SubSystem or from repurposed DB column PunchPointsCategoryClosed
+  const rawLegacyCol = (item as any).PunchPointsCategoryClosed;
+  const legacySubSys =
+    typeof rawLegacyCol === 'string' &&
+    !['yes', 'no', 'open', 'closed', 'pending', 'completed', 'not applicable', 'not started'].includes(
+      rawLegacyCol.trim().toLowerCase()
+    )
+      ? rawLegacyCol
+      : '';
+  const cleanedRawSubSys = cleanHierarchyField(item.SubSystem ?? legacySubSys, canonicalUnit);
+  const subSystem =
+    cleanedRawSubSys &&
+    cleanedRawSubSys.toUpperCase() !== systemNo.toUpperCase() &&
+    cleanedRawSubSys.toUpperCase() !== canonicalSubUnit.toUpperCase()
+      ? cleanedRawSubSys
+      : '';
+
+  const formatIVStatus = normalizeStageValue(
+    'FormatIVStatus',
+    item.FormatIVStatus ?? item.CategoryAStatus
+  );
+  const formatIVDate = item.FormatIVDate ?? item.LastInspectionDate ?? '';
+  const formatVStatus = normalizeStageValue(
+    'FormatVStatus',
+    item.FormatVStatus ?? item.MediaFillingClearance
+  );
+  const formatVDate = item.FormatVDate ?? item.ResponsibleAgency ?? '';
+  const pmiStatus = normalizeStageValue('PMI', item.PMI ?? item.RFINo);
 
   return {
     id: docId,
     Unit: canonicalUnit,
-    SubUnit: canonicalUnit === 'UTILITY' ? canonicalSubUnit : '',
+    SubUnit: canonicalSubUnit,
     SystemNo: systemNo,
+    SubSystem: subSystem,
     EquipmentTagNo: tag,
     EquipmentDescription: item.EquipmentDescription ?? '',
     EquipmentType: item.EquipmentType ?? '',
@@ -338,9 +728,13 @@ export function normalizeEquipmentRecord(
     FormatIIDate: item.FormatIIDate ?? '',
     FormatIIIStatus: normalizeStageValue('FormatIIIStatus', item.FormatIIIStatus),
     FormatIIIDate: item.FormatIIIDate ?? '',
+    FormatIVStatus: formatIVStatus,
+    FormatIVDate: formatIVDate,
+    FormatVStatus: formatVStatus,
+    FormatVDate: formatVDate,
     InternalInspectionStatus: normalizeStageValue('InternalInspectionStatus', item.InternalInspectionStatus),
     BaseLineUTG: normalizeStageValue('BaseLineUTG', item.BaseLineUTG),
-    PunchPointsCategoryClosed: item.PunchPointsCategoryClosed ?? '',
+    PMI: pmiStatus,
     FinalSystemAcceptance: normalizeStageValue('FinalSystemAcceptance', item.FinalSystemAcceptance),
     DocumentDrawing: item.DocumentDrawing ?? item.Link ?? '',
     Remarks: item.Remarks ?? '',
@@ -350,19 +744,64 @@ export function normalizeEquipmentRecord(
 }
 
 /**
- * Calculates overall equipment status strictly from its stage dropdowns:
- * - 'Completed': All stages are Done (Issued / Yes / Accept)
- * - 'In progress': At least 1 stage is Done, but not all stages
- * - 'Not started': 0 stages are Done (all are Not Issued / No / Not accept)
+ * Converts a normalized `EquipmentItem` into the exact column payload expected by `public.equipment`
+ * in Supabase PostgreSQL, storing `FormatIVStatus`, `FormatIVDate`, `FormatVStatus`, `FormatVDate`,
+ * `PMI`, and `SubSystem` inside the existing schema columns (`CategoryAStatus`, `LastInspectionDate`,
+ * `MediaFillingClearance`, `ResponsibleAgency`, `RFINo`, `PunchPointsCategoryClosed`) so zero manual DB migration is required.
+ */
+export function toDatabaseEquipmentRow(item: EquipmentItem): Record<string, any> {
+  return {
+    id: item.id,
+    Unit: item.Unit,
+    SubUnit: item.SubUnit ?? '',
+    SystemNo: item.SystemNo ?? '',
+    SubSystem: item.SubSystem ?? '',
+    EquipmentTagNo: item.EquipmentTagNo,
+    EquipmentDescription: item.EquipmentDescription ?? '',
+    EquipmentType: item.EquipmentType ?? '',
+    FormatIStatus: item.FormatIStatus ?? 'Not Issued',
+    FormatIDate: item.FormatIDate ?? '',
+    FormatIIStatus: item.FormatIIStatus ?? 'Not Issued',
+    FormatIIDate: item.FormatIIDate ?? '',
+    FormatIIIStatus: item.FormatIIIStatus ?? 'Not Issued',
+    FormatIIIDate: item.FormatIIIDate ?? '',
+    FormatIVStatus: item.FormatIVStatus ?? 'Not Issued',
+    FormatIVDate: item.FormatIVDate ?? '',
+    FormatVStatus: item.FormatVStatus ?? 'Not Issued',
+    FormatVDate: item.FormatVDate ?? '',
+    InternalInspectionStatus: item.InternalInspectionStatus ?? 'No',
+    BaseLineUTG: item.BaseLineUTG ?? 'No',
+    PMI: item.PMI ?? 'No',
+    FinalSystemAcceptance: item.FinalSystemAcceptance ?? 'Not Accepted',
+    DocumentDrawing: item.DocumentDrawing ?? '',
+    Remarks: item.Remarks ?? '',
+    // Legacy fallback columns for backward compatibility
+    PunchPointsCategoryClosed: item.SubSystem ?? '',
+    CategoryAStatus: item.FormatIVStatus ?? 'Not Issued',
+    LastInspectionDate: item.FormatIVDate ?? '',
+    MediaFillingClearance: item.FormatVStatus ?? 'Not Issued',
+    ResponsibleAgency: item.FormatVDate ?? '',
+    RFINo: item.PMI ?? 'No',
+    updatedBy: item.updatedBy ?? 'System',
+    updatedAt: item.updatedAt ?? '',
+  };
+}
+
+/**
+ * Calculates overall equipment status strictly from its progress stage dropdowns
+ * (Format-I to Format-V, Internal Insp., Final Accept. — excluding Base Line UTG and PMI):
+ * - 'Completed': All progress stages are Done (Issued / Yes / Accepted)
+ * - 'In progress': At least 1 progress stage is Done, but not all
+ * - 'Not started': 0 progress stages are Done
  */
 export function getEquipmentOverallStatus(item: EquipmentItem): 'Completed' | 'In progress' | 'Not started' {
   let doneStages = 0;
-  STATUS_COLUMNS.forEach((col) => {
+  PROGRESS_STAGE_COLUMNS.forEach((col) => {
     const val = (item[col.key] as string) || '';
     if (isDone(val)) doneStages++;
   });
 
-  if (doneStages === STATUS_COLUMNS.length) {
+  if (doneStages === PROGRESS_STAGE_COLUMNS.length) {
     return 'Completed';
   }
   if (doneStages > 0) {
@@ -373,7 +812,8 @@ export function getEquipmentOverallStatus(item: EquipmentItem): 'Completed' | 'I
 
 /**
  * Calculates percentage completion (0% to 100%) for any hierarchy scope
- * (single Equipment, Sub-Unit, Unit, or Entire Project) based on the stage dropdowns.
+ * (single Equipment, Sub-Unit, Unit, or Entire Project) based on the progress stages
+ * (Format-I, Format-II, Format-III, Format-IV, Format-V, Internal Insp., Final Accept. — excluding Base Line UTG and PMI).
  */
 export function calculateProgress(items: EquipmentItem[]): number {
   if (!items || items.length === 0) return 0;
@@ -381,7 +821,7 @@ export function calculateProgress(items: EquipmentItem[]): number {
   let totalCount = 0;
 
   items.forEach((item) => {
-    STATUS_COLUMNS.forEach((col) => {
+    PROGRESS_STAGE_COLUMNS.forEach((col) => {
       const val = (item[col.key] as string) || '';
       totalCount++;
       if (isDone(val)) doneCount++;
@@ -391,626 +831,5 @@ export function calculateProgress(items: EquipmentItem[]): number {
   return totalCount ? Math.round((doneCount / totalCount) * 100) : 0;
 }
 
-export const SAMPLE_EQUIPMENT_DATA: Omit<EquipmentItem, 'id'>[] = [
-  // ============================================================================
-  // 1. RPTU (Residue Processing & Treating Unit)
-  // ============================================================================
-  {
-    Unit: 'RPTU',
-    SubUnit: '',
-    SystemNo: 'RPTU-SYS-01 (High Pressure Reaction Loop)',
-    EquipmentTagNo: 'RPTU-R-1001A',
-    EquipmentDescription: 'RPTU Ebullated Bed Reactor #1',
-    EquipmentType: 'Reactor',
-    FormatIStatus: 'Issued',
-    FormatIDate: '2026-01-12',
-    FormatIIStatus: 'Issued',
-    FormatIIDate: '2026-02-05',
-    FormatIIIStatus: 'Issued',
-    FormatIIIDate: '2026-02-20',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    PunchPointsCategoryClosed: 'A',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-RPTU-GA-1001A Rev.2',
-    Remarks: 'Internal catalyst support grid and hydrotest accepted.',
-  },
-  {
-    Unit: 'RPTU',
-    SubUnit: '',
-    SystemNo: 'RPTU-SYS-02 (Hot High Pressure Separator)',
-    EquipmentTagNo: 'RPTU-V-1004',
-    EquipmentDescription: 'Hot High Pressure Separator Vessel',
-    EquipmentType: 'Vessel',
-    FormatIStatus: 'Issued',
-    FormatIDate: '2026-01-18',
-    FormatIIStatus: 'Issued',
-    FormatIIDate: '2026-02-14',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-RPTU-GA-1004 Rev.1',
-    Remarks: 'Demister pad installation under inspection.',
-  },
-  {
-    Unit: 'RPTU',
-    SubUnit: '',
-    SystemNo: 'RPTU-SYS-03 (Atmospheric Fractionator)',
-    EquipmentTagNo: 'RPTU-C-1010',
-    EquipmentDescription: 'RPTU Product Fractionator Column',
-    EquipmentType: 'Column',
-    FormatIStatus: 'Not Issued',
-    FormatIIStatus: 'Not Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-RPTU-DW-1010 Rev.0',
-  },
-
-  // ============================================================================
-  // 2. MSP (Motor Spirit Plant)
-  // ============================================================================
-  {
-    Unit: 'MSP',
-    SubUnit: '',
-    SystemNo: 'MSP-SYS-01 (Reformer Reactor & Regeneration)',
-    EquipmentTagNo: 'MSP-R-2101',
-    EquipmentDescription: 'CCR Platforming Stacked Reactor',
-    EquipmentType: 'Reactor',
-    FormatIStatus: 'Issued',
-    FormatIDate: '2026-01-15',
-    FormatIIStatus: 'Issued',
-    FormatIIDate: '2026-02-10',
-    FormatIIIStatus: 'Issued',
-    FormatIIIDate: '2026-03-01',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    PunchPointsCategoryClosed: 'A',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-MSP-GA-2101 Rev.3',
-    Remarks: 'Center pipe scallop screen & catalyst loading clearance signed.',
-  },
-  {
-    Unit: 'MSP',
-    SubUnit: '',
-    SystemNo: 'MSP-SYS-02 (Penex Isomerization Loop)',
-    EquipmentTagNo: 'MSP-C-2205',
-    EquipmentDescription: 'Reformate Splitter Column',
-    EquipmentType: 'Column',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-MSP-GA-2205 Rev.1',
-  },
-  {
-    Unit: 'MSP',
-    SubUnit: '',
-    SystemNo: 'MSP-SYS-03 (Naphtha Hydrotreater)',
-    EquipmentTagNo: 'MSP-E-2012A',
-    EquipmentDescription: 'Combined Feed / Effluent Heat Exchanger A',
-    EquipmentType: 'Heat Exchanger',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Not Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-MSP-EX-2012A Rev.0',
-  },
-
-  // ============================================================================
-  // 3. PFCCU (Petrochemical Fluidized Catalytic Cracking Unit)
-  // ============================================================================
-  {
-    Unit: 'PFCCU',
-    SubUnit: '',
-    SystemNo: 'PFCCU-SYS-01 (Converter & Riser System)',
-    EquipmentTagNo: 'PFCCU-R-3101',
-    EquipmentDescription: 'PFCCU Reactor-Regenerator Converter Assembly',
-    EquipmentType: 'Reactor',
-    FormatIStatus: 'Issued',
-    FormatIDate: '2026-01-22',
-    FormatIIStatus: 'Issued',
-    FormatIIDate: '2026-02-18',
-    FormatIIIStatus: 'Issued',
-    FormatIIIDate: '2026-03-12',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    PunchPointsCategoryClosed: 'A',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-PFCCU-GA-3101 Rev.2',
-    Remarks: 'Cyclone diplegs, refractory dry-out and air distributor verified.',
-  },
-  {
-    Unit: 'PFCCU',
-    SubUnit: '',
-    SystemNo: 'PFCCU-SYS-02 (Main Fractionator & Overhead)',
-    EquipmentTagNo: 'PFCCU-C-3201',
-    EquipmentDescription: 'PFCCU Main Fractionator Column',
-    EquipmentType: 'Column',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-PFCCU-GA-3201 Rev.1',
-  },
-  {
-    Unit: 'PFCCU',
-    SubUnit: '',
-    SystemNo: 'PFCCU-SYS-03 (Gas Concentration Section)',
-    EquipmentTagNo: 'PFCCU-K-3301',
-    EquipmentDescription: 'Two-Stage Centrifugal Wet Gas Compressor',
-    EquipmentType: 'Compressor',
-    FormatIStatus: 'Not Issued',
-    FormatIIStatus: 'Not Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-PFCCU-CM-3301 Rev.0',
-  },
-
-  // ============================================================================
-  // 4. CDU/VDU (Crude & Vacuum Distillation Unit)
-  // ============================================================================
-  {
-    Unit: 'CDU/VDU',
-    SubUnit: '',
-    SystemNo: 'CDU-SYS-01 (Atmospheric Crude Column)',
-    EquipmentTagNo: 'CDU-C-4101',
-    EquipmentDescription: 'Atmospheric Crude Distillation Column',
-    EquipmentType: 'Column',
-    FormatIStatus: 'Issued',
-    FormatIDate: '2026-01-10',
-    FormatIIStatus: 'Issued',
-    FormatIIDate: '2026-02-02',
-    FormatIIIStatus: 'Issued',
-    FormatIIIDate: '2026-02-25',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    PunchPointsCategoryClosed: 'A',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-CDU-GA-4101 Rev.3',
-    Remarks: 'All 48 valve trays and structured packing sections inspected and boxed up.',
-  },
-  {
-    Unit: 'CDU/VDU',
-    SubUnit: '',
-    SystemNo: 'VDU-SYS-02 (Vacuum Column & Ejector)',
-    EquipmentTagNo: 'VDU-C-4201',
-    EquipmentDescription: 'Vacuum Distillation Column',
-    EquipmentType: 'Column',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-VDU-GA-4201 Rev.2',
-  },
-  {
-    Unit: 'CDU/VDU',
-    SubUnit: '',
-    SystemNo: 'CDU-SYS-03 (Two-Stage Crude Desalter)',
-    EquipmentTagNo: 'CDU-V-4105A',
-    EquipmentDescription: 'First Stage Electrostatic Desalter Vessel',
-    EquipmentType: 'Vessel',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-CDU-VS-4105A Rev.1',
-  },
-
-  // ============================================================================
-  // 5. DHDT (Diesel Hydrotreating Unit)
-  // ============================================================================
-  {
-    Unit: 'DHDT',
-    SubUnit: '',
-    SystemNo: 'DHDT-SYS-01 (Hydrotreating Reactor Train)',
-    EquipmentTagNo: 'DHDT-R-5101',
-    EquipmentDescription: 'DHDT Main Hydrotreating Reactor',
-    EquipmentType: 'Reactor',
-    FormatIStatus: 'Issued',
-    FormatIDate: '2026-01-20',
-    FormatIIStatus: 'Issued',
-    FormatIIDate: '2026-02-15',
-    FormatIIIStatus: 'Issued',
-    FormatIIIDate: '2026-03-05',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    PunchPointsCategoryClosed: 'A',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-DHDT-GA-5101 Rev.2',
-    Remarks: 'Quench zone distributor and thermowell nozzles verified.',
-  },
-  {
-    Unit: 'DHDT',
-    SubUnit: '',
-    SystemNo: 'DHDT-SYS-02 (Product Stripper & Dryer)',
-    EquipmentTagNo: 'DHDT-C-5201',
-    EquipmentDescription: 'Diesel Product Stripper Column',
-    EquipmentType: 'Column',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-DHDT-GA-5201 Rev.1',
-  },
-  {
-    Unit: 'DHDT',
-    SubUnit: '',
-    SystemNo: 'DHDT-SYS-03 (Recycle & Make-up H2 Gas)',
-    EquipmentTagNo: 'DHDT-K-5301A',
-    EquipmentDescription: 'Make-Up Hydrogen Reciprocating Compressor A',
-    EquipmentType: 'Compressor',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Not Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-DHDT-CM-5301A Rev.0',
-  },
-
-  // ============================================================================
-  // 6. SRB (Sulfur Recovery Block)
-  // ============================================================================
-  {
-    Unit: 'SRB',
-    SubUnit: '',
-    SystemNo: 'SRB-SYS-01 (Thermal Reactor & Waste Heat Boiler)',
-    EquipmentTagNo: 'SRB-R-6101A',
-    EquipmentDescription: 'Claus Main Reaction Furnace & WHB Train A',
-    EquipmentType: 'Reactor / WHB',
-    FormatIStatus: 'Issued',
-    FormatIDate: '2026-02-01',
-    FormatIIStatus: 'Issued',
-    FormatIIDate: '2026-02-22',
-    FormatIIIStatus: 'Issued',
-    FormatIIIDate: '2026-03-15',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    PunchPointsCategoryClosed: 'A',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-SRB-GA-6101A Rev.2',
-    Remarks: 'Refractory lining holiday test and ferrule installation completed.',
-  },
-  {
-    Unit: 'SRB',
-    SubUnit: '',
-    SystemNo: 'SRB-SYS-02 (Tail Gas Treating Unit)',
-    EquipmentTagNo: 'SRB-C-6202',
-    EquipmentDescription: 'Tail Gas Amine Absorber Column',
-    EquipmentType: 'Column',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-SRB-GA-6202 Rev.1',
-  },
-
-  // ============================================================================
-  // 7. UTILITY -> Sub-Unit 1: DM-CPU
-  // ============================================================================
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'DM-CPU',
-    SystemNo: 'DM-CPU',
-    EquipmentTagNo: '1U59-TT-4831',
-    EquipmentDescription: 'Equalization Tank',
-    EquipmentType: 'Tank',
-    FormatIStatus: 'Issued',
-    FormatIDate: '2025-08-21',
-    FormatIIStatus: 'Issued',
-    FormatIIDate: '2026-03-27',
-    FormatIIIStatus: 'Issued',
-    FormatIIIDate: '2026-04-23',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    PunchPointsCategoryClosed: 'A',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-UTIL-DM-4831 Rev.2',
-    Remarks: 'Hydrostatic test complete. Calibration certificate verified.',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'DM-CPU',
-    SystemNo: 'DM-CPU',
-    EquipmentTagNo: '1U59-TT-5133A',
-    EquipmentDescription: 'Degasser Water Storage Tank A',
-    EquipmentType: 'Tank',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-UTIL-DM-5133A Rev.1',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'DM-CPU',
-    SystemNo: 'DM-CPU',
-    EquipmentTagNo: '1U59-TT-4633',
-    EquipmentDescription: 'DM Water Storage Tank #1',
-    EquipmentType: 'Tank',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-UTIL-DM-4633 Rev.2',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'DM-CPU',
-    SystemNo: 'DM-CPU',
-    EquipmentTagNo: '1U59-MB-4201A',
-    EquipmentDescription: 'Condensate Polishing Mixed Bed Vessel A',
-    EquipmentType: 'Vessel',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Not Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-UTIL-DM-4201A Rev.0',
-  },
-
-  // ============================================================================
-  // 7. UTILITY -> Sub-Unit 2: N2U
-  // ============================================================================
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'N2U',
-    SystemNo: 'N2U',
-    EquipmentTagNo: '1U53-TK-201',
-    EquipmentDescription: 'Liquid Nitrogen Cryogenic Storage Vessel',
-    EquipmentType: 'Cryogenic Vessel',
-    FormatIStatus: 'Issued',
-    FormatIDate: '2026-02-11',
-    FormatIIStatus: 'Issued',
-    FormatIIDate: '2026-03-02',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-UTIL-N2U-201 Rev.2',
-    Remarks: 'Vacuum perlite insulation & cold box pressure test completed.',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'N2U',
-    SystemNo: 'N2U',
-    EquipmentTagNo: '1U53-CP-101A',
-    EquipmentDescription: 'Main Air Separation Centrifugal Compressor A',
-    EquipmentType: 'Compressor',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Not Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-UTIL-N2U-101A Rev.1',
-  },
-
-  // ============================================================================
-  // 7. UTILITY -> Sub-Unit 3: CA-IA
-  // ============================================================================
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'CA-IA',
-    SystemNo: 'CA-IA',
-    EquipmentTagNo: '1U54-CP-301A',
-    EquipmentDescription: 'Oil-Free Screw Instrument Air Compressor A',
-    EquipmentType: 'Compressor',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-UTIL-CAIA-301A Rev.2',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'CA-IA',
-    SystemNo: 'CA-IA',
-    EquipmentTagNo: '1U54-AD-302A',
-    EquipmentDescription: 'Heatless Regenerative Instrument Air Dryer A',
-    EquipmentType: 'Air Dryer',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-UTIL-CAIA-302A Rev.1',
-  },
-
-  // ============================================================================
-  // 7. UTILITY -> Sub-Unit 4: BOILERS AND HRSG
-  // ============================================================================
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'BOILERS AND HRSG',
-    SystemNo: 'BOILERS AND HRSG',
-    EquipmentTagNo: '1U51-DR-1001',
-    EquipmentDescription: 'HP Steam Drum #1 (HRSG-1)',
-    EquipmentType: 'Vessel',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-UTIL-BLR-1001 Rev.3',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'BOILERS AND HRSG',
-    SystemNo: 'BOILERS AND HRSG',
-    EquipmentTagNo: '1U51-PM-1021A',
-    EquipmentDescription: 'Main Boiler Feed Water Pump A',
-    EquipmentType: 'Pump',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-UTIL-BLR-1021A Rev.1',
-  },
-
-  // ============================================================================
-  // 7. UTILITY -> Sub-Unit 5: COOLING TOWER
-  // ============================================================================
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'COOLING TOWER',
-    SystemNo: 'COOLING TOWER',
-    EquipmentTagNo: '1U52-CT-201A',
-    EquipmentDescription: 'Induced Draft Cooling Tower Cell #1 Fan & Gearbox',
-    EquipmentType: 'Cooling Tower',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-UTIL-CT-201A Rev.2',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'COOLING TOWER',
-    SystemNo: 'COOLING TOWER',
-    EquipmentTagNo: '1U52-PM-202A',
-    EquipmentDescription: 'Cooling Water Vertical Turbine Circulation Pump A',
-    EquipmentType: 'Pump',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Not Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-UTIL-CT-202A Rev.0',
-  },
-
-  // ============================================================================
-  // 7. UTILITY -> Sub-Unit 6: RWDU
-  // ============================================================================
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'RWDU',
-    SystemNo: 'RWDU',
-    EquipmentTagNo: '1U55-CL-101',
-    EquipmentDescription: 'Raw Water Desilting Clariflocculator Mechanism',
-    EquipmentType: 'Clarifier',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-UTIL-RWDU-101 Rev.2',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'RWDU',
-    SystemNo: 'RWDU',
-    EquipmentTagNo: '1U55-PM-102A',
-    EquipmentDescription: 'Desilted Water Transfer Pump A',
-    EquipmentType: 'Pump',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-UTIL-RWDU-102A Rev.1',
-  },
-
-  // ============================================================================
-  // 7. UTILITY -> Sub-Unit 7: RW FILTER
-  // ============================================================================
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'RW FILTER',
-    SystemNo: 'RW FILTER',
-    EquipmentTagNo: '1U56-FL-201A',
-    EquipmentDescription: 'Dual Media Pressure Sand Filter Vessel A',
-    EquipmentType: 'Filter Vessel',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-UTIL-RWF-201A Rev.2',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'RW FILTER',
-    SystemNo: 'RW FILTER',
-    EquipmentTagNo: '1U56-BL-203A',
-    EquipmentDescription: 'Filter Backwash Air Scouring Blower A',
-    EquipmentType: 'Blower',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Not Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'No',
-    BaseLineUTG: 'No',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-UTIL-RWF-203A Rev.1',
-  },
-
-  // ============================================================================
-  // 7. UTILITY -> Sub-Unit 8: RW RESERVOIR
-  // ============================================================================
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'RW RESERVOIR',
-    SystemNo: 'RW RESERVOIR',
-    EquipmentTagNo: '1U57-PM-301A',
-    EquipmentDescription: 'Raw Water Reservoir Vertical Intake Pump A',
-    EquipmentType: 'Pump',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Accept',
-    DocumentDrawing: 'NRL-UTIL-RWR-301A Rev.2',
-  },
-  {
-    Unit: 'UTILITY',
-    SubUnit: 'RW RESERVOIR',
-    SystemNo: 'RW RESERVOIR',
-    EquipmentTagNo: '1U57-TK-302',
-    EquipmentDescription: 'Raw Water Reservoir Surge Protection Vessel',
-    EquipmentType: 'Vessel',
-    FormatIStatus: 'Issued',
-    FormatIIStatus: 'Issued',
-    FormatIIIStatus: 'Not Issued',
-    InternalInspectionStatus: 'Yes',
-    BaseLineUTG: 'Yes',
-    FinalSystemAcceptance: 'Not accept',
-    DocumentDrawing: 'NRL-UTIL-RWR-302 Rev.1',
-  },
-];
+// No hardcoded equipment data — all equipment data is stored and synced live in Supabase
+export const SAMPLE_EQUIPMENT_DATA: Omit<EquipmentItem, 'id'>[] = [];

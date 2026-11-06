@@ -24,7 +24,7 @@ function MainApp() {
         <div style={{ textAlign: 'center' }}>
           <div style={{ fontSize: '36px', marginBottom: '12px' }}>🏭</div>
           <div style={{ fontSize: '16px', fontWeight: 600 }}>NRL · NREP Inspection Monitor</div>
-          <div style={{ fontSize: '12px', opacity: 0.7, marginTop: '4px' }}>Connecting to Cloud Firestore...</div>
+          <div style={{ fontSize: '12px', opacity: 0.7, marginTop: '4px' }}>Connecting to Supabase Cloud...</div>
         </div>
       </div>
     );

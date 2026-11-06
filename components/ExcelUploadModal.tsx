@@ -73,12 +73,9 @@ export default function ExcelUploadModal({ isOpen, onClose }: ExcelUploadModalPr
           rowObj[header] = String(val).trim();
         });
 
-        // Hierarchical inheritance like the original template
+        // Hierarchical inheritance for Unit
         if (rowObj['Unit']) currentUnit = rowObj['Unit'];
-        else rowObj['Unit'] = currentUnit || 'Unassigned';
-
-        if (rowObj['System No.']) currentSystem = rowObj['System No.'];
-        else rowObj['System No.'] = currentSystem || 'General System';
+        else rowObj['Unit'] = currentUnit || 'RPTU';
 
         // Check cell hyperlink if present on Tag or Document/Drawing cell
         const docCell = docIndex >= 0 ? ws[XLSX.utils.encode_cell({ r, c: docIndex })] : null;
@@ -119,7 +116,7 @@ export default function ExcelUploadModal({ isOpen, onClose }: ExcelUploadModalPr
             </div>
             <div>
               <h3 className="text-base font-semibold">Upload Excel Equipment Master</h3>
-              <p className="text-xs text-sky-200">Seamless real-time synchronization to Cloud Firestore</p>
+              <p className="text-xs text-sky-200">Seamless real-time synchronization to Supabase Cloud</p>
             </div>
           </div>
           <button
@@ -145,7 +142,7 @@ export default function ExcelUploadModal({ isOpen, onClose }: ExcelUploadModalPr
           >
             <UploadCloud className="w-10 h-10 text-slate-400 group-hover:text-sky-600 mx-auto mb-2 transition-colors" />
             <div className="text-xs font-semibold text-slate-800">
-              {loading ? 'Processing & Syncing to Cloud Firestore...' : 'Click to select spreadsheet or drop file here'}
+              {loading ? 'Processing & Syncing to Supabase Cloud...' : 'Click to select spreadsheet or drop file here'}
             </div>
             <div className="text-[11px] text-slate-500 mt-1">Accepts standard NRL NREP inspection template formats</div>
             <input
@@ -164,7 +161,7 @@ export default function ExcelUploadModal({ isOpen, onClose }: ExcelUploadModalPr
                 <span className="font-semibold">Cloud Sync Completed Successfully:</span>
                 <div className="mt-0.5">
                   Added <b className="font-mono">{result.added}</b> new equipment and updated{' '}
-                  <b className="font-mono">{result.updated}</b> existing assets in Firestore.
+                  <b className="font-mono">{result.updated}</b> existing assets in Supabase.
                 </div>
               </div>
             </div>

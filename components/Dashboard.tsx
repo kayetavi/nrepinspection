@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useState, useEffect, useRef } from 'react';
+import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import { useAuth } from '@/lib/auth-context';
 import { useEquipment } from '@/lib/equipment-context';
@@ -8,15 +8,39 @@ import {
   EquipmentItem,
   UNITS,
   UTILITY_SUB_UNITS,
+  MSP_SUB_UNITS,
+  resolveMspSubUnit,
   STATUS_COLUMNS,
+  PROGRESS_STAGE_COLUMNS,
   STATUS_OPTIONS,
+  StatusColumnConfig,
   isDone,
   isInProgress,
   getEquipmentOverallStatus,
   calculateProgress,
+  isAllUnitsScope,
+  getUserAllowedUnits,
+  filterEquipmentByUserScope,
+  getEquipmentHierarchyChain,
+  formatEquipmentHierarchyPath,
+  cleanHierarchyField,
 } from '@/lib/types';
-import AdminPanel from './AdminPanel';
+import AdminPanel, { AdminTabKey, AdminSubAction } from './AdminPanel';
 import EquipmentEditModal from './EquipmentEditModal';
+import InspectionReportModal from './InspectionReportModal';
+import CloudFolderSyncModal from './CloudFolderSyncModal';
+import {
+  UploadProgressPopup,
+  SweetSuccessPopup,
+  SweetSuccessMetaItem,
+  SweetWarningDeletePopup,
+} from './SweetPopupModal';
+import {
+  parseEquipmentDocumentField,
+  serializeEquipmentDocumentField,
+  formatDocumentDrawingForExcel,
+  getProviderBadgeMeta,
+} from '@/lib/reportUtils';
 import {
   Factory,
   Layers,
@@ -29,9 +53,41 @@ import {
   Check,
   Search,
   X,
+  MessageSquare,
+  MessageCircle,
+  ChevronRight,
+  FolderSync,
+  FileText,
+  Upload,
+  FolderTree,
+  FileSpreadsheet,
+  Download,
+  Database,
+  Lock,
+  Table2,
+  Save,
+  Trash2,
+  RotateCcw,
 } from 'lucide-react';
 
 type ViewLevel = 'p' | 'u' | 's' | 'e' | 'tools' | 'admin';
+
+export interface HierarchyTreeNode {
+  id: string;
+  key: string;
+  name: string;
+  pathLabel: string;
+  levelType: 'subunit' | 'system' | 'subsystem';
+  levelBadge: 'Sub-Unit' | 'System' | 'Sub-System';
+  unitName: string;
+  subUnitName: string;
+  systemName: string;
+  subSystemName: string;
+  items: EquipmentItem[];
+  directItems: EquipmentItem[];
+  children: HierarchyTreeNode[];
+  ancestorIds: string[];
+}
 
 export default function Dashboard() {
   const {
@@ -44,8 +100,11 @@ export default function Dashboard() {
     signOut,
     signInWithGoogle,
   } = useAuth();
+  const canAccessLiveDatabase =
+    isAdmin || profile?.role === 'lead_engineer';
   const {
-    equipment,
+    equipment: rawEquipment,
+    unitsConfig,
     loading,
     error,
     updateEquipmentField,
@@ -53,7 +112,20 @@ export default function Dashboard() {
     deleteEquipment,
     importFromExcel,
     resetToSampleData,
+    refreshEquipment,
+    auditLogs,
   } = useEquipment();
+
+  // Dynamically scope units and equipment according to the user's Assigned Scope (assignedUnits)
+  const isUnitScoped = useMemo(
+    () => !isAllUnitsScope(profile?.assignedUnits),
+    [profile?.assignedUnits]
+  );
+
+  const equipment = useMemo(
+    () => filterEquipmentByUserScope(rawEquipment, profile),
+    [rawEquipment, profile, unitsConfig]
+  );
 
   // Navigation route & hierarchy state
   const [viewLevel, setViewLevel] = useState<ViewLevel>('p');
@@ -61,11 +133,55 @@ export default function Dashboard() {
   const [selectedSystemName, setSelectedSystemName] = useState<string | null>(null);
   const [selectedEquipmentTag, setSelectedEquipmentTag] = useState<string | null>(null);
 
-  // Drawer tree state (UTILITY and its first Sub-Unit DM-CPU expanded by default so the full revised hierarchy is immediately visible)
+  // Admin & Live Database Sidebar Hierarchy state
+  const [adminTreeExpanded, setAdminTreeExpanded] = useState(false);
+  const [expandedAdminSections, setExpandedAdminSections] = useState<Set<string>>(
+    () => new Set(['1', '2', '3', '5', '6', '7'])
+  );
+  const [adminActiveTab, setAdminActiveTab] = useState<AdminTabKey>('database');
+  const [adminSubAction, setAdminSubAction] = useState<{
+    action: AdminSubAction;
+    ts: number;
+  } | null>(null);
+
+  const toggleAdminSection = (sectionId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setExpandedAdminSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(sectionId)) next.delete(sectionId);
+      else next.add(sectionId);
+      return next;
+    });
+  };
+
+  const openAdminSheet = (
+    tab: AdminTabKey,
+    subAction?: AdminSubAction,
+    closeDrawer = true
+  ) => {
+    if (typeof window !== 'undefined') {
+      window.history.pushState(null, '', '#admin');
+    }
+    setViewLevel('admin');
+    setAdminActiveTab(tab);
+    if (subAction) {
+      setAdminSubAction((prev) => ({ action: subAction, ts: (prev?.ts || 0) + 1 }));
+    }
+    if (closeDrawer) {
+      setTreeOpen(false);
+    }
+  };
+
+  // Drawer tree state (All units, sub-units, systems, sub-systems, and equipment collapsed by default)
   const [treeOpen, setTreeOpen] = useState(false);
+  const [hierarchyOpen, setHierarchyOpen] = useState(false);
   const [treeFilter, setTreeFilter] = useState('');
-  const [expandedUnits, setExpandedUnits] = useState<Set<string>>(() => new Set(['unit-1', 'unit-7']));
-  const [expandedSystems, setExpandedSystems] = useState<Set<string>>(() => new Set(['system-7-1']));
+  const [expandedUnits, setExpandedUnits] = useState<Set<string>>(() => new Set());
+  const [expandedSystems, setExpandedSystems] = useState<Set<string>>(() => new Set());
+  const [hierUnitDropdown, setHierUnitDropdown] = useState<string>('');
+  const [hierSubUnitDropdown, setHierSubUnitDropdown] = useState<string>('');
+  const [hierSystemDropdown, setHierSystemDropdown] = useState<string>('');
+  const [hierSubSystemDropdown, setHierSubSystemDropdown] = useState<string>('');
 
   // Global search & drop-down
   const [globalSearch, setGlobalSearch] = useState('');
@@ -76,17 +192,229 @@ export default function Dashboard() {
 
   // In-place direct equipment editing & Modals
   const [editingEquipment, setEditingEquipment] = useState<EquipmentItem | null>(null);
+  const [reportModalState, setReportModalState] = useState<{
+    item: EquipmentItem;
+    tab?: 'view' | 'attach';
+    viewOnly?: boolean;
+  } | null>(null);
+  const [showCloudSyncModal, setShowCloudSyncModal] = useState(false);
   const [showAdminPanel, setShowAdminPanel] = useState(false);
   const [excelNotice, setExcelNotice] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [uploadingExcelFile, setUploadingExcelFile] = useState<string | null>(null);
+  const [dashboardSweetSuccess, setDashboardSweetSuccess] = useState<{
+    title: string;
+    message: string;
+    badgeText?: string;
+    metaItems?: SweetSuccessMetaItem[];
+  } | null>(null);
+
+  // Auto-hide Excel notification popup after 3 seconds
+  useEffect(() => {
+    if (!excelNotice) return;
+    const timer = setTimeout(() => {
+      setExcelNotice(null);
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [excelNotice]);
 
   // KPI expanded details drilldown
   const [kpiFilter, setKpiFilter] = useState<string | null>(null);
   const [kpiSearch, setKpiSearch] = useState('');
+  const [kpiTypeFilter, setKpiTypeFilter] = useState('');
 
-  // Table inner search filters
+  // Table inner search filters & pagination
   const [systemSearch, setSystemSearch] = useState('');
   const [systemStatusFilter, setSystemStatusFilter] = useState('');
+  const [systemTypeFilter, setSystemTypeFilter] = useState('');
   const [tableSearch, setTableSearch] = useState('');
+  const [equipPage, setEquipPage] = useState(1);
+  const [equipPageSize, setEquipPageSize] = useState(15);
+
+  const getAvailableEquipmentTypes = (items: EquipmentItem[]) => {
+    const counts = new Map<string, number>();
+    items.forEach((item) => {
+      const t = (item.EquipmentType || '').trim();
+      if (t) {
+        counts.set(t, (counts.get(t) || 0) + 1);
+      }
+    });
+    return Array.from(counts.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([type, count]) => ({ type, count }));
+  };
+
+  // Unit-wise Remarks modal & filter state
+  const [remarksModalUnit, setRemarksModalUnit] = useState<string | null>(null);
+  const [remarksFilterSearch, setRemarksFilterSearch] = useState('');
+  const [stageDrilldownModal, setStageDrilldownModal] = useState<{
+    col: StatusColumnConfig;
+    items: EquipmentItem[];
+  } | null>(null);
+  const [stageDrilldownSearch, setStageDrilldownSearch] = useState('');
+  const [greenToast, setGreenToast] = useState<{ message: string; visible: boolean } | null>(null);
+
+  const showGreenToast = (message: string) => {
+    setGreenToast({ message, visible: true });
+    setTimeout(() => {
+      setGreenToast((prev) => (prev?.message === message ? null : prev));
+    }, 3500);
+  };
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setEquipPage(1);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [
+    viewLevel,
+    selectedUnitName,
+    selectedSystemName,
+    systemSearch,
+    systemStatusFilter,
+    systemTypeFilter,
+    kpiFilter,
+    kpiSearch,
+    kpiTypeFilter,
+  ]);
+
+  const renderPaginationBar = (totalItems: number) => {
+    if (totalItems <= 0) return null;
+    const effectiveSize = equipPageSize > 0 ? equipPageSize : totalItems;
+    const totalPages = Math.max(1, Math.ceil(totalItems / effectiveSize));
+    const currentPage = Math.min(equipPage, totalPages);
+    const startIdx = (currentPage - 1) * effectiveSize;
+    const endIdx = Math.min(startIdx + effectiveSize, totalItems);
+
+    const getVisiblePages = () => {
+      const pages: number[] = [];
+      const maxButtons = 5;
+      let start = Math.max(1, currentPage - 2);
+      const end = Math.min(totalPages, start + maxButtons - 1);
+      if (end - start + 1 < maxButtons) {
+        start = Math.max(1, end - maxButtons + 1);
+      }
+      for (let p = start; p <= end; p++) pages.push(p);
+      return pages;
+    };
+
+    return (
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: '10px',
+          marginTop: '10px',
+          padding: '9px 12px',
+          background: '#f8fafc',
+          border: '1px solid var(--bd)',
+          borderRadius: '8px',
+          fontSize: '12px',
+          color: 'var(--tx)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+          <span style={{ color: 'var(--mu)', fontWeight: 500 }}>
+            Showing <b style={{ color: 'var(--tx)' }}>{startIdx + 1}–{endIdx}</b> of{' '}
+            <b style={{ color: 'var(--tx)' }}>{totalItems}</b> equipment
+          </span>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: 'var(--mu)', fontSize: '11.5px' }}>
+            <span>Rows:</span>
+            <select
+              value={equipPageSize}
+              onChange={(e) => {
+                setEquipPageSize(Number(e.target.value));
+                setEquipPage(1);
+              }}
+              style={{
+                padding: '3px 7px',
+                fontSize: '11.5px',
+                fontWeight: 600,
+                borderRadius: '5px',
+                border: '1px solid #cbd5e1',
+                background: '#fff',
+                color: 'var(--tx)',
+                cursor: 'pointer',
+              }}
+            >
+              <option value={10}>10 / page</option>
+              <option value={15}>15 / page</option>
+              <option value={25}>25 / page</option>
+              <option value={50}>50 / page</option>
+              <option value={100}>100 / page</option>
+              <option value={0}>Show All</option>
+            </select>
+          </label>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '5px', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            disabled={currentPage <= 1}
+            onClick={() => setEquipPage(Math.max(1, currentPage - 1))}
+            style={{
+              padding: '4px 10px',
+              fontSize: '11.5px',
+              fontWeight: 600,
+              borderRadius: '6px',
+              border: '1px solid #cbd5e1',
+              background: currentPage <= 1 ? '#f1f5f9' : '#ffffff',
+              color: currentPage <= 1 ? '#94a3b8' : '#0f172a',
+              cursor: currentPage <= 1 ? 'not-allowed' : 'pointer',
+              transition: 'all 0.15s ease',
+            }}
+          >
+            ← Previous
+          </button>
+
+          {getVisiblePages().map((p) => {
+            const isActive = p === currentPage;
+            return (
+              <button
+                key={p}
+                type="button"
+                onClick={() => setEquipPage(p)}
+                style={{
+                  minWidth: '28px',
+                  height: '28px',
+                  padding: '0 7px',
+                  fontSize: '11.5px',
+                  fontWeight: 700,
+                  borderRadius: '6px',
+                  border: isActive ? '1px solid #0284c7' : '1px solid #cbd5e1',
+                  background: isActive ? '#0284c7' : '#ffffff',
+                  color: isActive ? '#ffffff' : '#334155',
+                  cursor: 'pointer',
+                }}
+              >
+                {p}
+              </button>
+            );
+          })}
+
+          <button
+            type="button"
+            disabled={currentPage >= totalPages}
+            onClick={() => setEquipPage(Math.min(totalPages, currentPage + 1))}
+            style={{
+              padding: '4px 10px',
+              fontSize: '11.5px',
+              fontWeight: 600,
+              borderRadius: '6px',
+              border: '1px solid #cbd5e1',
+              background: currentPage >= totalPages ? '#f1f5f9' : '#ffffff',
+              color: currentPage >= totalPages ? '#94a3b8' : '#0f172a',
+              cursor: currentPage >= totalPages ? 'not-allowed' : 'pointer',
+              transition: 'all 0.15s ease',
+            }}
+          >
+            Next →
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   // Unit-wise progress bar chart states
   const [unitSortBy, setUnitSortBy] = useState<'progress-desc' | 'progress-asc' | 'name' | 'pending-desc'>('progress-desc');
@@ -116,60 +444,233 @@ export default function Dashboard() {
     setKpiFilter(null);
     setKpiSearch('');
     setTreeOpen(false);
+    setHierarchyOpen(false);
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'smooth' });
       document.getElementById('main')?.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
 
-  // Canonical 7 Units list: RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB, UTILITY
+  // Canonical Units list dynamically scoped by the user's Assigned Scope (assignedUnits) and deduplicated case-insensitively
   const allUnitsList = useMemo(() => {
-    return [...UNITS];
-  }, []);
+    const allowed = getUserAllowedUnits(profile);
+    const map = new Map<string, string>();
+    allowed.forEach((u) => map.set(u.toUpperCase(), u));
+    equipment.forEach((i) => {
+      const u = (i.Unit || '').trim();
+      if (u) {
+        const upper = u.toUpperCase();
+        if (!map.has(upper)) {
+          map.set(upper, u);
+        }
+      }
+    });
+    return Array.from(map.values());
+  }, [profile, equipment, unitsConfig]);
 
-  // Tree data structure:
-  // - 7 Top-Level Units: RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB, UTILITY
-  // - First 6 Units (RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB): Equipment resides directly inside the Unit
-  // - 7th Unit (UTILITY): 8 Sub-Units (DM-CPU, N2U, CA-IA, BOILERS AND HRSG, COOLING TOWER, RWDU, RW FILTER, RW RESERVOIR) -> Equipment resides inside each Sub-Unit
+  // 4-Level Skip-Aware Hierarchy Tree Data Structure:
+  // Unit -> [Sub-Unit] -> [System] -> [Sub-System] -> Equipment
+  // Any level left blank in Excel or UI is automatically skipped so the item/node attaches directly to the previous filled level.
   const treeData = useMemo(() => {
     return allUnitsList.map((unitName, uIdx) => {
-      const unitItems = equipment.filter((i) => i.Unit === unitName);
+      const unitItems = equipment.filter(
+        (i) => (i.Unit || '').trim().toUpperCase() === unitName.trim().toUpperCase()
+      );
+      const rootChildren: HierarchyTreeNode[] = [];
+      const directItems: EquipmentItem[] = [];
+      const nodeMap = new Map<string, HierarchyTreeNode>();
 
+      // Pre-seed canonical Sub-Units for UTILITY and MSP so they remain available in dropdowns and structure views
       if (unitName === 'UTILITY') {
-        const subUnitsList = [...UTILITY_SUB_UNITS];
-        unitItems.forEach((item) => {
-          const su = item.SubUnit || item.AreaPackage || item.SystemNo;
-          if (su && !subUnitsList.includes(su)) {
-            subUnitsList.push(su);
-          }
+        UTILITY_SUB_UNITS.forEach((su) => {
+          const key = `subunit:${su.toUpperCase()}`;
+          const node: HierarchyTreeNode = {
+            id: '',
+            key,
+            name: su,
+            pathLabel: su,
+            levelType: 'subunit',
+            levelBadge: 'Sub-Unit',
+            unitName,
+            subUnitName: su,
+            systemName: '',
+            subSystemName: '',
+            items: [],
+            directItems: [],
+            children: [],
+            ancestorIds: [],
+          };
+          nodeMap.set(key, node);
+          rootChildren.push(node);
         });
-        return {
-          name: unitName,
-          id: `unit-${uIdx + 1}`,
-          items: unitItems,
-          systems: subUnitsList.map((subName, sIdx) => ({
-            name: subName,
-            id: `system-${uIdx + 1}-${sIdx + 1}`,
-            items: unitItems.filter(
-              (i) => (i.SubUnit || i.AreaPackage || i.SystemNo) === subName
-            ),
-          })),
-        };
+      } else if (unitName === 'MSP') {
+        MSP_SUB_UNITS.forEach((su) => {
+          const key = `subunit:${su.toUpperCase()}`;
+          const node: HierarchyTreeNode = {
+            id: '',
+            key,
+            name: su,
+            pathLabel: su,
+            levelType: 'subunit',
+            levelBadge: 'Sub-Unit',
+            unitName,
+            subUnitName: su,
+            systemName: '',
+            subSystemName: '',
+            items: [],
+            directItems: [],
+            children: [],
+            ancestorIds: [],
+          };
+          nodeMap.set(key, node);
+          rootChildren.push(node);
+        });
       }
 
-      const uniqueSystems = [...new Set(unitItems.map((i) => i.SystemNo).filter(Boolean))];
+      unitItems.forEach((item) => {
+        const chain = getEquipmentHierarchyChain(item);
+        const subSteps = chain.slice(1); // Skip 'unit' step at index 0
+
+        if (subSteps.length === 0) {
+          // Sub-Unit, System, and Sub-System are all blank -> attach directly under Unit!
+          directItems.push(item);
+          return;
+        }
+
+        let currentList = rootChildren;
+        let pathKeyPrefix = '';
+        let pathLabelParts: string[] = [];
+        let accSubUnit = '';
+        let accSystem = '';
+        let accSubSystem = '';
+        let lastNode: HierarchyTreeNode | null = null;
+
+        subSteps.forEach((step) => {
+          const stepType = step.level as 'subunit' | 'system' | 'subsystem';
+          const stepBadge = step.label as 'Sub-Unit' | 'System' | 'Sub-System';
+          if (stepType === 'subunit') accSubUnit = step.value;
+          if (stepType === 'system') accSystem = step.value;
+          if (stepType === 'subsystem') accSubSystem = step.value;
+
+          const nodeKey = pathKeyPrefix
+            ? `${pathKeyPrefix}::${stepType}:${step.value.toUpperCase()}`
+            : `${stepType}:${step.value.toUpperCase()}`;
+          pathKeyPrefix = nodeKey;
+          pathLabelParts = [...pathLabelParts, step.value];
+
+          let node = nodeMap.get(nodeKey);
+          if (!node) {
+            node = {
+              id: '',
+              key: nodeKey,
+              name: step.value,
+              pathLabel: pathLabelParts.join(' › '),
+              levelType: stepType,
+              levelBadge: stepBadge,
+              unitName,
+              subUnitName: accSubUnit,
+              systemName: accSystem,
+              subSystemName: accSubSystem,
+              items: [],
+              directItems: [],
+              children: [],
+              ancestorIds: [],
+            };
+            nodeMap.set(nodeKey, node);
+            currentList.push(node);
+          }
+          node.items.push(item);
+          currentList = node.children;
+          lastNode = node;
+        });
+
+        if (lastNode) {
+          (lastNode as HierarchyTreeNode).directItems.push(item);
+        }
+      });
+
+      // Assign stable sequential IDs (#system-u-s) and ancestorIds in pre-order traversal
+      const flatSystems: HierarchyTreeNode[] = [];
+      let sCounter = 0;
+      const assignIds = (nodes: HierarchyTreeNode[], parentAncestorIds: string[]) => {
+        nodes.forEach((n) => {
+          sCounter++;
+          n.id = `system-${uIdx + 1}-${sCounter}`;
+          n.ancestorIds = [...parentAncestorIds, n.id];
+          flatSystems.push(n);
+          if (n.children.length > 0) {
+            assignIds(n.children, n.ancestorIds);
+          }
+        });
+      };
+      assignIds(rootChildren, []);
+
+      // Top-level unique hierarchy nodes under the Unit (e.g. unique Systems in DHDT: TEST, PTEST;
+      // or unique Sub-Units in MSP/Utility). Child Sub-Systems (e.g. TEST-2, TEST-3) are nested inside
+      // their parent System and shown when clicking into that System.
+      const tableSystems = rootChildren;
+
       return {
         name: unitName,
         id: `unit-${uIdx + 1}`,
         items: unitItems,
-        systems: uniqueSystems.map((sysName, sIdx) => ({
-          name: sysName,
-          id: `system-${uIdx + 1}-${sIdx + 1}`,
-          items: unitItems.filter((i) => i.SystemNo === sysName),
-        })),
+        directItems,
+        children: rootChildren,
+        systems: flatSystems,
+        tableSystems,
       };
     });
   }, [allUnitsList, equipment]);
+
+  // Dedicated helper to extract unique systems strictly from the System column (SystemNo).
+  // Only equipment where the System column is populated (via Excel or manual edit) is counted.
+  // Units and Sub-Units are NEVER counted as systems.
+  const getUniqueSystemsFromList = useCallback((itemList: EquipmentItem[]) => {
+    const map = new Map<
+      string,
+      {
+        key: string;
+        systemName: string;
+        unit: string;
+        subUnit?: string;
+        items: EquipmentItem[];
+      }
+    >();
+
+    itemList.forEach((item) => {
+      const rawSys = (item.SystemNo || '').trim();
+      const cleanSys = cleanHierarchyField(rawSys, item.Unit);
+      if (!cleanSys) return; // Skip if no system is specified in System column
+
+      const unitName = (item.Unit || 'UNKNOWN').trim();
+      const key = `${unitName.toUpperCase()}::${cleanSys.toUpperCase()}`;
+
+      const existing = map.get(key);
+      if (existing) {
+        existing.items.push(item);
+        if (!existing.subUnit && item.SubUnit && cleanHierarchyField(item.SubUnit, item.Unit)) {
+          existing.subUnit = item.SubUnit.trim();
+        }
+      } else {
+        map.set(key, {
+          key,
+          systemName: cleanSys,
+          unit: unitName,
+          subUnit: item.SubUnit && cleanHierarchyField(item.SubUnit, item.Unit) ? item.SubUnit.trim() : undefined,
+          items: [item],
+        });
+      }
+    });
+
+    return Array.from(map.values()).sort((a, b) => {
+      if (a.unit !== b.unit) return a.unit.localeCompare(b.unit);
+      return a.systemName.localeCompare(b.systemName, undefined, { numeric: true });
+    });
+  }, []);
+
+  const overallUniqueSystems = useMemo(() => {
+    return getUniqueSystemsFromList(equipment);
+  }, [equipment, getUniqueSystemsFromList]);
 
   // Handle URL hash routing
   useEffect(() => {
@@ -177,6 +678,10 @@ export default function Dashboard() {
       const hash = window.location.hash.slice(1);
       setKpiFilter(null);
       setKpiSearch('');
+      setKpiTypeFilter('');
+      setSystemTypeFilter('');
+      setTreeOpen(false);
+      setHierarchyOpen(false);
       document.getElementById('main')?.scrollTo({ top: 0, behavior: 'smooth' });
 
       // Default or empty hash always stays cleanly on Home (level 'p')
@@ -212,7 +717,6 @@ export default function Dashboard() {
           setSelectedUnitName(u.name);
           setSelectedSystemName(null);
           setSelectedEquipmentTag(null);
-          setExpandedUnits((prev) => new Set([...prev, u.id]));
           return;
         }
       }
@@ -224,10 +728,8 @@ export default function Dashboard() {
         if (u && s) {
           setViewLevel('s');
           setSelectedUnitName(u.name);
-          setSelectedSystemName(s.name);
+          setSelectedSystemName(s.id);
           setSelectedEquipmentTag(null);
-          setExpandedUnits((prev) => new Set([...prev, u.id]));
-          setExpandedSystems((prev) => new Set([...prev, s.id]));
           return;
         }
       }
@@ -237,9 +739,11 @@ export default function Dashboard() {
         const tag = decodeURIComponent(eqMatch[1]);
         const item = equipment.find((i) => i.EquipmentTagNo === tag || i.id === tag);
         if (item) {
+          const u = treeData.find((unitObj) => unitObj.name.toLowerCase() === (item.Unit || '').trim().toLowerCase());
+          const ownerNode = u?.systems.find((s) => s.directItems.some((d) => d.id === item.id));
           setViewLevel('e');
           setSelectedUnitName(item.Unit);
-          setSelectedSystemName(item.Unit === 'UTILITY' ? (item.SubUnit || item.AreaPackage || item.SystemNo) : item.SystemNo);
+          setSelectedSystemName(ownerNode ? ownerNode.id : null);
           setSelectedEquipmentTag(item.EquipmentTagNo);
           return;
         }
@@ -283,21 +787,79 @@ export default function Dashboard() {
     }
   }, [searchBoxOpen]);
 
+  // Current active unit, hierarchy node (Sub-Unit / System / Sub-System), & equipment objects
+  const activeUnit = useMemo(
+    () =>
+      treeData.find(
+        (u) => u.name.toUpperCase() === (selectedUnitName || '').trim().toUpperCase()
+      ),
+    [treeData, selectedUnitName]
+  );
+  const activeSystem = useMemo(
+    () =>
+      activeUnit?.systems.find(
+        (s) =>
+          s.id === selectedSystemName ||
+          s.key === selectedSystemName ||
+          s.name === selectedSystemName
+      ),
+    [activeUnit, selectedSystemName]
+  );
+  const activeEquipment = useMemo(
+    () =>
+      equipment.find(
+        (i) => i.EquipmentTagNo === selectedEquipmentTag || i.id === selectedEquipmentTag
+      ),
+    [equipment, selectedEquipmentTag]
+  );
+
+  // Consolidated inline Equipment Detail & Edit state (eliminates duplicate Edit modal on viewLevel === 'e')
+  const [eqForm, setEqForm] = useState<EquipmentItem | null>(null);
+  const [eqDrawingRef, setEqDrawingRef] = useState<string>('');
+  const [savingEqForm, setSavingEqForm] = useState(false);
+  const [eqSaveNotice, setEqSaveNotice] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [confirmDeleteEq, setConfirmDeleteEq] = useState(false);
+  const [deletingEq, setDeletingEq] = useState(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (activeEquipment) {
+        setEqForm({
+          ...activeEquipment,
+          SubUnit: cleanHierarchyField(activeEquipment.SubUnit),
+          SystemNo: cleanHierarchyField(activeEquipment.SystemNo),
+          SubSystem: cleanHierarchyField(activeEquipment.SubSystem),
+          FormatIVStatus: activeEquipment.FormatIVStatus || 'Not Issued',
+          FormatIVDate: activeEquipment.FormatIVDate || '',
+          FormatVStatus: activeEquipment.FormatVStatus || 'Not Issued',
+          FormatVDate: activeEquipment.FormatVDate || '',
+          PMI: activeEquipment.PMI || 'No',
+        });
+        const parsedDoc = parseEquipmentDocumentField(activeEquipment.DocumentDrawing);
+        setEqDrawingRef(parsedDoc.drawingRef || '');
+        setEqSaveNotice(null);
+        setConfirmDeleteEq(false);
+      } else {
+        setEqForm(null);
+        setEqDrawingRef('');
+      }
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [activeEquipment]);
+
   // Scope equipment calculation
   const scopeItems = useMemo(() => {
     if (viewLevel === 'p') return equipment;
-    if (viewLevel === 'u' && selectedUnitName) return equipment.filter((i) => i.Unit === selectedUnitName);
-    if (viewLevel === 's' && selectedUnitName && selectedSystemName) {
-      return equipment.filter((i) => {
-        if (i.Unit !== selectedUnitName) return false;
-        if (selectedUnitName === 'UTILITY') {
-          return (i.SubUnit || i.AreaPackage || i.SystemNo) === selectedSystemName;
-        }
-        return i.SystemNo === selectedSystemName;
-      });
+    if (viewLevel === 'u' && selectedUnitName) {
+      return equipment.filter(
+        (i) => (i.Unit || '').trim().toUpperCase() === selectedUnitName.trim().toUpperCase()
+      );
+    }
+    if (viewLevel === 's' && activeSystem) {
+      return activeSystem.items;
     }
     return equipment;
-  }, [viewLevel, selectedUnitName, selectedSystemName, equipment]);
+  }, [viewLevel, selectedUnitName, activeSystem, equipment]);
 
   // Stats for the current scope
   const stats = useMemo(() => {
@@ -569,13 +1131,6 @@ export default function Dashboard() {
     );
   };
 
-  // Current active unit & system objects
-  const activeUnit = treeData.find((u) => u.name === selectedUnitName);
-  const activeSystem = activeUnit?.systems.find((s) => s.name === selectedSystemName);
-  const activeEquipment = equipment.find(
-    (i) => i.EquipmentTagNo === selectedEquipmentTag || i.id === selectedEquipmentTag
-  );
-
   // Stage-wise pending counts helper
   const getPendingStageCount = (items: EquipmentItem[], colKey: keyof EquipmentItem) => {
     return items.filter((r) => {
@@ -584,11 +1139,20 @@ export default function Dashboard() {
     }).length;
   };
 
+  // Stage-wise completed / done counts helper (work done: Issued, Yes, Accept)
+  const getDoneStageCount = (items: EquipmentItem[], colKey: keyof EquipmentItem) => {
+    return items.filter((r) => {
+      const val = ((r[colKey] as string) || '').trim();
+      return isDone(val);
+    }).length;
+  };
+
   // Excel Upload Handler matching revised 18-column schema
   const handleExcelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    setUploadingExcelFile(file.name);
     try {
       const buffer = await file.arrayBuffer();
       const wb = XLSX.read(buffer, { cellDates: true });
@@ -609,7 +1173,6 @@ export default function Dashboard() {
 
       const rows: any[] = [];
       let curUnit = '';
-      let curSys = '';
 
       for (let r = headerIndex + 1; r < aoa.length; r++) {
         const row = aoa[r];
@@ -627,10 +1190,10 @@ export default function Dashboard() {
         });
 
         if (obj.Unit) curUnit = obj.Unit;
-        else obj.Unit = curUnit || 'Unassigned';
+        else obj.Unit = curUnit || 'RPTU';
 
-        if (obj['System No.']) curSys = obj['System No.'];
-        else obj['System No.'] = curSys || 'System not assigned';
+        // Note: Sub-Unit, System No., and Sub-System are intentionally NOT filled with placeholders
+        // when left blank in Excel. Any blank hierarchy level automatically skips to the previous filled parent!
 
         // Support hyperlinks on Document/Drawing cell or Equipment Tag No. cell
         const docCell = docDrawIndex >= 0 ? ws[XLSX.utils.encode_cell({ r, c: docDrawIndex })] : null;
@@ -645,9 +1208,20 @@ export default function Dashboard() {
       }
 
       const res = await importFromExcel(rows);
+      const okMsg = `${rows.length} equipment loaded and synced with Supabase Cloud! (${res.added} added, ${res.updated} updated)`;
       setExcelNotice({
         type: 'ok',
-        text: `${rows.length} equipment loaded and synced with Cloud Firestore! (${res.added} added, ${res.updated} updated)`,
+        text: okMsg,
+      });
+      setDashboardSweetSuccess({
+        title: 'Excel File Uploaded Successfully!',
+        badgeText: 'Live Cloud Sync Complete',
+        message: okMsg,
+        metaItems: [
+          { label: 'Excel File', value: file.name, highlight: 'blue' },
+          { label: 'Total Rows Processed', value: `${rows.length} Equipment`, highlight: 'green' },
+          { label: 'Added / Updated', value: `${res.added} Added · ${res.updated} Updated` },
+        ],
       });
     } catch (err: any) {
       setExcelNotice({
@@ -655,16 +1229,18 @@ export default function Dashboard() {
         text: 'Upload failed: ' + (err.message || 'Invalid Excel file'),
       });
     } finally {
+      setUploadingExcelFile(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
-  // Excel Download Handler (Revised 18 Columns — removed Area/Package, RFI No., Category-A Status, Media Filling Clearance, Last Inspection Date, Responsible Agency/Person, Link; added Base Line UTG & Document/Drawing)
+  // Excel Download Handler (23 Columns — Unit, Sub-Unit, System No., Sub-System, Tag, Description, Type, Format-I to V Status & Dates, Internal Inspection, Base Line UTG, PMI, Final Acceptance, Document/Drawing, Remarks)
   const handleExcelDownload = () => {
     const H = [
       'Unit',
       'Sub-Unit',
       'System No.',
+      'Sub-System',
       'Equipment Tag No.',
       'Equipment Description',
       'Equipment Type',
@@ -674,9 +1250,13 @@ export default function Dashboard() {
       'Format-II Date',
       'Format-III Status',
       'Format-III Date',
+      'Format-IV Status',
+      'Format-IV Date',
+      'Format-V Status',
+      'Format-V Date',
       'Internal Inspection Status',
       'Base Line UTG',
-      'Punch Points Category Closed',
+      'PMI',
       'Final System Acceptance',
       'Document/Drawing',
       'Remarks',
@@ -684,8 +1264,9 @@ export default function Dashboard() {
 
     const data = equipment.map((r) => [
       r.Unit || '',
-      r.Unit === 'UTILITY' ? (r.SubUnit || r.SystemNo || '') : '',
+      r.SubUnit || '',
       r.SystemNo || '',
+      r.SubSystem || '',
       r.EquipmentTagNo || '',
       r.EquipmentDescription || '',
       r.EquipmentType || '',
@@ -695,11 +1276,15 @@ export default function Dashboard() {
       r.FormatIIDate || '',
       r.FormatIIIStatus || '',
       r.FormatIIIDate || '',
+      r.FormatIVStatus || '',
+      r.FormatIVDate || '',
+      r.FormatVStatus || '',
+      r.FormatVDate || '',
       r.InternalInspectionStatus || '',
       r.BaseLineUTG || '',
-      r.PunchPointsCategoryClosed || '',
+      r.PMI || '',
       r.FinalSystemAcceptance || '',
-      r.DocumentDrawing || '',
+      formatDocumentDrawingForExcel(r.DocumentDrawing),
       r.Remarks || '',
     ]);
 
@@ -709,12 +1294,13 @@ export default function Dashboard() {
     XLSX.writeFile(wb, 'NREP_Inspection_Equipment_Tracker_updated.xlsx');
   };
 
-  // Excel Template Download Handler (Revised 18 Columns)
+  // Excel Template Download Handler (23 Columns + Picklist Guide Sheet)
   const handleDownloadTemplate = () => {
     const H = [
       'Unit',
       'Sub-Unit',
       'System No.',
+      'Sub-System',
       'Equipment Tag No.',
       'Equipment Description',
       'Equipment Type',
@@ -724,9 +1310,13 @@ export default function Dashboard() {
       'Format-II Date',
       'Format-III Status',
       'Format-III Date',
+      'Format-IV Status',
+      'Format-IV Date',
+      'Format-V Status',
+      'Format-V Date',
       'Internal Inspection Status',
       'Base Line UTG',
-      'Punch Points Category Closed',
+      'PMI',
       'Final System Acceptance',
       'Document/Drawing',
       'Remarks',
@@ -736,9 +1326,10 @@ export default function Dashboard() {
       [
         'RPTU',
         '',
-        'RPTU-SYS-01',
-        'RPTU-R-1001A',
-        'RPTU Ebullated Bed Reactor #1',
+        '',
+        '',
+        '1P30-RB-2221',
+        '1St Lc-Fining Reactor (Direct under Unit — Sub-Unit/System/Sub-System skipped)',
         'Reactor',
         'Issued',
         '2026-01-12',
@@ -746,17 +1337,47 @@ export default function Dashboard() {
         '2026-02-05',
         'Issued',
         '2026-02-20',
+        'Issued',
+        '2026-03-02',
+        'Issued',
+        '2026-03-15',
         'Yes',
         'Yes',
-        'A',
-        'Accept',
-        'NRL-RPTU-GA-1001A Rev.2',
-        'Internal inspection completed',
+        'Yes',
+        'Accepted',
+        'NRL-RPTU-GA-2221 Rev.2',
+        'Sub-Unit, System & Sub-System left blank -> automatically placed directly under RPTU',
+      ],
+      [
+        'MSP',
+        'NHT',
+        'NHT-SYS-01',
+        'NHT-SUB-01A',
+        'MSP-V-2101',
+        'NHT Reactor Effluent Separator (Full 4-Level Hierarchy)',
+        'Vessel',
+        'Issued',
+        '2026-02-10',
+        'Not Issued',
+        '',
+        'Not Issued',
+        '',
+        'Not Issued',
+        '',
+        'Not Issued',
+        '',
+        'No',
+        'No',
+        'No',
+        'Not Accepted',
+        'NRL-MSP-NHT-2101 Rev.1',
+        'Full hierarchy: MSP > NHT > NHT-SYS-01 > NHT-SUB-01A',
       ],
       [
         'UTILITY',
         'DM-CPU',
-        'DM-CPU',
+        'DM-SYS-01',
+        'CPU-TRAIN-A',
         '1U59-TT-4831',
         'Equalization Tank',
         'Tank',
@@ -766,18 +1387,341 @@ export default function Dashboard() {
         '2026-03-27',
         'Issued',
         '2026-04-23',
+        'Issued',
+        '2026-05-04',
+        'Issued',
+        '2026-05-12',
         'Yes',
         'Yes',
-        'A',
-        'Accept',
+        'Yes',
+        'Accepted',
         'NRL-UTIL-DM-4831 Rev.2',
-        'Hydrostatic test complete',
+        'Hydrostatic test & PMI complete',
       ],
     ];
 
-    const ws = XLSX.utils.aoa_to_sheet([['NREP EQUIPMENT LIST - TEMPLATE (Units: RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB, UTILITY)'], H, ...sampleRows]);
+    const ws = XLSX.utils.aoa_to_sheet([
+      [
+        'NREP EQUIPMENT LIST - TEMPLATE (Refer to the "Picklist" sheet tab below for allowed values, formats & skip-level hierarchy instructions)',
+      ],
+      H,
+      ...sampleRows,
+    ]);
+
+    ws['!cols'] = [
+      { wch: 14 }, // Unit
+      { wch: 18 }, // Sub-Unit
+      { wch: 18 }, // System No.
+      { wch: 18 }, // Sub-System
+      { wch: 20 }, // Equipment Tag No.
+      { wch: 36 }, // Equipment Description
+      { wch: 18 }, // Equipment Type
+      { wch: 16 }, // Format-I Status
+      { wch: 15 }, // Format-I Date
+      { wch: 16 }, // Format-II Status
+      { wch: 15 }, // Format-II Date
+      { wch: 16 }, // Format-III Status
+      { wch: 15 }, // Format-III Date
+      { wch: 16 }, // Format-IV Status
+      { wch: 15 }, // Format-IV Date
+      { wch: 16 }, // Format-V Status
+      { wch: 15 }, // Format-V Date
+      { wch: 24 }, // Internal Inspection Status
+      { wch: 16 }, // Base Line UTG
+      { wch: 14 }, // PMI
+      { wch: 24 }, // Final System Acceptance
+      { wch: 28 }, // Document/Drawing
+      { wch: 36 }, // Remarks
+    ];
+
+    // Sheet 2: "Picklist" — Complete Column-by-Column Filling Guide & Valid Dropdown Options
+    const picklistAoa: any[][] = [
+      ['NREP EQUIPMENT UPLOAD TEMPLATE — PICKLIST & COLUMN FILLING GUIDE (23 COLUMNS)'],
+      [
+        'Important: Fill your equipment data in the "Equipment Master" sheet (Sheet 1). Do NOT rename the 23 column headers in Row 2. Smart Skip-Level Rule: Hierarchy is Unit > Sub-Unit > System No. > Sub-System. Any column left blank will automatically skip to the previous filled column (e.g. if Sub-Unit, System No., and Sub-System are all left blank, the equipment is placed directly under the Unit!).',
+      ],
+      [],
+      ['PART 1: COLUMN-BY-COLUMN FORMAT & FILLING INSTRUCTIONS (23 COLUMNS)'],
+      [
+        'Col No.',
+        'Excel Column',
+        'Column Header Name (Exact)',
+        'Mandatory / Optional',
+        'Data Format',
+        'Allowed Picklist Values / Options',
+        'Example Value',
+        'How to Fill (Easy Instructions)',
+      ],
+      [
+        '1',
+        'Column A',
+        'Unit',
+        'Mandatory (Level 1)',
+        'Picklist (Exact Text)',
+        UNITS.join(', '),
+        UNITS[0] || 'RPTU',
+        `Select one of the official NREP Project Units (${UNITS.join(', ')}).`,
+      ],
+      [
+        '2',
+        'Column B',
+        'Sub-Unit',
+        'Optional (Level 2 — Auto-Skip if Blank)',
+        'Picklist / Text',
+        'UTILITY: DM-CPU, N2U, CA-IA, BOILERS AND HRSG, COOLING TOWER, RWDU, RW FILTER, RW RESERVOIR | MSP: NHT, CCR, ISOM | Or any Sub-Unit / Leave Blank to skip',
+        'NHT',
+        'Agar Sub-Unit hai toh bharein. Agar khali (blank) chhod denge toh app automatically Sub-Unit skip karke seedha Unit ke andar System ya Equipment dikhayega.',
+      ],
+      [
+        '3',
+        'Column C',
+        'System No.',
+        'Optional (Level 3 — Auto-Skip if Blank)',
+        'Text / System Code',
+        'Any System No. (e.g. RPTU-SYS-01, NHT-SYS-01) OR Leave Blank to skip directly to Unit / Sub-Unit',
+        'NHT-SYS-01',
+        'System No. likhein. Agar khali (blank) chhod denge toh automatic previous level (Sub-Unit ya Unit) ke andar chala jayega.',
+      ],
+      [
+        '4',
+        'Column D',
+        'Sub-System',
+        'Optional (Level 4 — Auto-Skip if Blank)',
+        'Text / Sub-System Code',
+        'Any Sub-System name/code under System (e.g. NHT-SUB-01A, CPU-TRAIN-A) OR Leave Blank to skip',
+        'NHT-SUB-01A',
+        'System ke andar agar Sub-System hai toh yahan likhein. Agar khali (blank) rakhenge toh automatic previous level (System, Sub-Unit, ya Unit) mein jud jayega.',
+      ],
+      [
+        '5',
+        'Column E',
+        'Equipment Tag No.',
+        'Mandatory (Unique Key)',
+        'Text / Tag Code',
+        'Unique Equipment Tag No. (No duplicate tags)',
+        'RPTU-R-1001A',
+        'Har equipment ka unique Tag No. likhein. Yahi Tag No. record update karne aur PDF report link karne ke kaam aata hai.',
+      ],
+      [
+        '6',
+        'Column F',
+        'Equipment Description',
+        'Recommended',
+        'Free Text',
+        'Equipment service name / description',
+        'RPTU Ebullated Bed Reactor #1',
+        'Equipment ka poora naam ya description likhein.',
+      ],
+      [
+        '7',
+        'Column G',
+        'Equipment Type',
+        'Recommended',
+        'Picklist / Text',
+        'Vessel, Column, Reactor, Heat Exchanger, Tank, Drum, Filter, Boiler, Heater, Pump, Package, Silo',
+        'Reactor',
+        'Equipment ka type likhein (jaise Vessel, Column, Tank, Heat Exchanger, Reactor, etc.).',
+      ],
+      [
+        '8',
+        'Column H',
+        'Format-I Status',
+        'Mandatory',
+        'Picklist (2 Options)',
+        'Issued, Not Issued',
+        'Issued',
+        'Agar Format-I complete/issue ho gaya hai toh "Issued" likhein, warna "Not Issued" likhein.',
+      ],
+      [
+        '9',
+        'Column I',
+        'Format-I Date',
+        'Optional',
+        'Date (YYYY-MM-DD)',
+        'YYYY-MM-DD (or DD-MM-YYYY Excel Date) — Leave blank if Not Issued',
+        '2026-01-12',
+        'Format-I issue hone ki date YYYY-MM-DD format mein likhein (jaise 2026-01-12). Agar Not Issued hai toh blank chhod dein.',
+      ],
+      [
+        '10',
+        'Column J',
+        'Format-II Status',
+        'Mandatory',
+        'Picklist (2 Options)',
+        'Issued, Not Issued',
+        'Issued',
+        'Agar Format-II complete/issue ho gaya hai toh "Issued" likhein, warna "Not Issued" likhein.',
+      ],
+      [
+        '11',
+        'Column K',
+        'Format-II Date',
+        'Optional',
+        'Date (YYYY-MM-DD)',
+        'YYYY-MM-DD (or DD-MM-YYYY Excel Date) — Leave blank if Not Issued',
+        '2026-02-05',
+        'Format-II issue hone ki date YYYY-MM-DD format mein likhein. Agar Not Issued hai toh blank chhod dein.',
+      ],
+      [
+        '12',
+        'Column L',
+        'Format-III Status',
+        'Mandatory',
+        'Picklist (2 Options)',
+        'Issued, Not Issued',
+        'Not Issued',
+        'Agar Format-III complete/issue ho gaya hai toh "Issued" likhein, warna "Not Issued" likhein.',
+      ],
+      [
+        '13',
+        'Column M',
+        'Format-III Date',
+        'Optional',
+        'Date (YYYY-MM-DD)',
+        'YYYY-MM-DD (or DD-MM-YYYY Excel Date) — Leave blank if Not Issued',
+        '2026-02-20',
+        'Format-III issue hone ki date YYYY-MM-DD format mein likhein. Agar Not Issued hai toh blank chhod dein.',
+      ],
+      [
+        '14',
+        'Column N',
+        'Format-IV Status',
+        'Mandatory',
+        'Picklist (2 Options)',
+        'Issued, Not Issued',
+        'Not Issued',
+        'Agar Format-IV complete/issue ho gaya hai toh "Issued" likhein, warna "Not Issued" likhein.',
+      ],
+      [
+        '15',
+        'Column O',
+        'Format-IV Date',
+        'Optional',
+        'Date (YYYY-MM-DD)',
+        'YYYY-MM-DD (or DD-MM-YYYY Excel Date) — Leave blank if Not Issued',
+        '2026-03-02',
+        'Format-IV issue hone ki date YYYY-MM-DD format mein likhein. Agar Not Issued hai toh blank chhod dein.',
+      ],
+      [
+        '16',
+        'Column P',
+        'Format-V Status',
+        'Mandatory',
+        'Picklist (2 Options)',
+        'Issued, Not Issued',
+        'Not Issued',
+        'Agar Format-V complete/issue ho gaya hai toh "Issued" likhein, warna "Not Issued" likhein.',
+      ],
+      [
+        '17',
+        'Column Q',
+        'Format-V Date',
+        'Optional',
+        'Date (YYYY-MM-DD)',
+        'YYYY-MM-DD (or DD-MM-YYYY Excel Date) — Leave blank if Not Issued',
+        '2026-03-15',
+        'Format-V issue hone ki date YYYY-MM-DD format mein likhein. Agar Not Issued hai toh blank chhod dein.',
+      ],
+      [
+        '18',
+        'Column R',
+        'Internal Inspection Status',
+        'Mandatory',
+        'Picklist (2 Options)',
+        'Yes, No',
+        'Yes',
+        'Agar Internal Inspection complete ho chuka hai toh "Yes" likhein, warna "No" likhein.',
+      ],
+      [
+        '19',
+        'Column S',
+        'Base Line UTG',
+        'Mandatory (Info Only — Excluded from %)',
+        'Picklist (2 Options)',
+        'Yes, No',
+        'Yes',
+        'Agar Base Line Ultrasonic Thickness Gauging (UTG) complete ho chuka hai toh "Yes" likhein, warna "No" likhein.',
+      ],
+      [
+        '20',
+        'Column T',
+        'PMI',
+        'Mandatory (Info Only — Excluded from %)',
+        'Picklist (2 Options)',
+        'Yes, No',
+        'Yes',
+        'Agar Positive Material Identification (PMI) complete ho chuka hai toh "Yes" likhein, warna "No" likhein.',
+      ],
+      [
+        '21',
+        'Column U',
+        'Final System Acceptance',
+        'Mandatory',
+        'Picklist (2 Options)',
+        'Accepted, Not Accepted',
+        'Accepted',
+        'Agar Final System Acceptance complete hai toh "Accepted" likhein, warna "Not Accepted" likhein.',
+      ],
+      [
+        '22',
+        'Column V',
+        'Document/Drawing',
+        'Optional',
+        'Text / URL',
+        'Drawing Ref No. OR Google Drive / OneDrive share link (https://...)',
+        'NRL-RPTU-GA-1001A Rev.2',
+        'Drawing number likhein ya Google Drive / OneDrive report ka link paste karein.',
+      ],
+      [
+        '23',
+        'Column W',
+        'Remarks',
+        'Optional',
+        'Free Text',
+        'Any inspection notes, pending status, or observations',
+        'Hydrostatic test complete',
+        'Equipment se juda koi bhi remark ya comment yahan likhein.',
+      ],
+      [],
+      ['PART 2: READY-TO-COPY PICKLIST VALUES (COPY & PASTE INTO "Equipment Master" SHEET)'],
+      [
+        'Unit Picklist (7 Units)',
+        'UTILITY Sub-Unit Picklist (8 Sub-Units)',
+        'MSP Sub-Unit Picklist (3 Sub-Units)',
+        'Format-I / II / III / IV / V Status',
+        'Internal Insp., Base Line UTG & PMI',
+        'Final System Acceptance',
+        'Common Equipment Types',
+      ],
+      ['RPTU', 'DM-CPU', 'NHT', 'Issued', 'Yes', 'Accepted', 'Vessel'],
+      ['MSP', 'N2U', 'CCR', 'Not Issued', 'No', 'Not Accepted', 'Column'],
+      ['PFCCU', 'CA-IA', 'ISOM', '', '', '', 'Reactor'],
+      ['CDU/VDU', 'BOILERS AND HRSG', '', '', '', '', 'Heat Exchanger'],
+      ['DHDT', 'COOLING TOWER', '', '', '', '', 'Tank'],
+      ['SRB', 'RWDU', '', '', '', '', 'Drum'],
+      ['UTILITY', 'RW FILTER', '', '', '', '', 'Filter'],
+      ['', 'RW RESERVOIR', '', '', '', '', 'Boiler'],
+      ['', '', '', '', '', '', 'Heater'],
+      ['', '', '', '', '', '', 'Pump'],
+      ['', '', '', '', '', '', 'Package'],
+      ['', '', '', '', '', '', 'Silo'],
+    ];
+
+    const picklistWs = XLSX.utils.aoa_to_sheet(picklistAoa);
+    picklistWs['!cols'] = [
+      { wch: 24 },
+      { wch: 34 },
+      { wch: 30 },
+      { wch: 34 },
+      { wch: 32 },
+      { wch: 58 },
+      { wch: 28 },
+      { wch: 64 },
+    ];
+
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Equipment Master');
+    XLSX.utils.book_append_sheet(wb, picklistWs, 'Picklist');
     XLSX.writeFile(wb, 'NREP_Equipment_Upload_Template.xlsx');
   };
 
@@ -874,7 +1818,16 @@ export default function Dashboard() {
     );
   };
 
-  // Stage-wise horizontal bars
+  const getStageDate = (item: EquipmentItem, colKey: keyof EquipmentItem) => {
+    if (colKey === 'FormatIStatus') return item.FormatIDate || item.updatedAt || '—';
+    if (colKey === 'FormatIIStatus') return item.FormatIIDate || item.updatedAt || '—';
+    if (colKey === 'FormatIIIStatus') return item.FormatIIIDate || item.updatedAt || '—';
+    if (colKey === 'FormatIVStatus') return item.FormatIVDate || item.updatedAt || '—';
+    if (colKey === 'FormatVStatus') return item.FormatVDate || item.updatedAt || '—';
+    return item.updatedAt || '—';
+  };
+
+  // Stage-wise horizontal bars with hyperlinks for equipment drilldown, dates & user IDs
   const renderStageWiseBars = (items: EquipmentItem[]) => {
     const t = items.length || 1;
 
@@ -893,34 +1846,66 @@ export default function Dashboard() {
           const pct = items.length ? Math.round((done / t) * 100) : 0;
 
           return (
-            <div key={col.key} className="sr">
-              <span title={`${col.label} (${col.doneValue} / ${col.pendingValue})`}>{col.short}</span>
-              <div className="sb">
+            <div
+              key={col.key}
+              className="sr"
+              onClick={() => {
+                setStageDrilldownSearch('');
+                setStageDrilldownModal({ col, items });
+              }}
+              style={{
+                cursor: 'pointer',
+                borderRadius: '5px',
+                padding: '3px 6px',
+                transition: 'background 0.15s ease',
+              }}
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLDivElement).style.background = '#e0f2fe';
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLDivElement).style.background = 'transparent';
+              }}
+              title={`Click to view equipment list, dates & user IDs for ${col.label}`}
+            >
+              <span
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  color: '#0284c7',
+                  fontWeight: 600,
+                  textDecoration: 'underline',
+                }}
+                title={`${col.label} (${col.doneValue} / ${col.pendingValue}) — Click for equipment hyperlink list`}
+              >
+                <span>{col.short}</span>
+              </span>
+              <div className="sb" style={{ cursor: 'pointer' }}>
                 {done > 0 && (
                   <i
-                    title={`${col.doneValue}: ${done} (${pct}%)`}
+                    title={`${col.doneValue}: ${done} (${pct}%) — Click for details`}
                     style={{ width: `${(done / t) * 100}%`, background: 'var(--gr)' }}
                   />
                 )}
                 {pending > 0 && (
                   <i
-                    title={`${col.pendingValue}: ${pending} (${100 - pct}%)`}
+                    title={`${col.pendingValue}: ${pending} (${100 - pct}%) — Click for details`}
                     style={{ width: `${(pending / t) * 100}%`, background: 'var(--am)' }}
                   />
                 )}
               </div>
-              <b style={{ minWidth: '58px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+              <b style={{ minWidth: '58px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: '#0f172a' }}>
                 {done}/{items.length} ({pct}%)
               </b>
             </div>
           );
         })}
-        <div className="lg">
+        <div className="lg" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px', fontSize: '11px' }}>
           <span>
-            <i style={{ background: 'var(--gr)' }}></i>Done (Issued / Yes / Accept)
+            <i style={{ background: 'var(--gr)' }}></i>Done (Issued / Yes / Accept) · <b style={{ color: '#0284c7' }}>Click any stage bar for equipment hyperlink list, dates &amp; user IDs</b>
           </span>
           <span>
-            <i style={{ background: 'var(--am)' }}></i>Pending (Not Issued / No / Not accept)
+            <i style={{ background: 'var(--am)' }}></i>Pending
           </span>
         </div>
       </>
@@ -979,51 +1964,136 @@ export default function Dashboard() {
     return <span className={`c ${done ? 'g' : prog ? 'a' : ''}`}>{status}</span>;
   };
 
-  // Helper renderer for Document/Drawing column (supports drawing numbers, document refs, or URLs)
-  const renderDocumentDrawing = (docVal?: string) => {
-    const val = (docVal || '').trim();
-    if (!val) return <span style={{ color: 'var(--mu)' }}>—</span>;
-    if (/^https?:\/\//i.test(val)) {
+  // Helper renderer for Document/Drawing & Live Inspection Reports column
+  const renderDocumentDrawing = (docVal?: string, equipItem?: EquipmentItem) => {
+    const { drawingRef, reports } = parseEquipmentDocumentField(docVal);
+
+    if (reports.length > 0 && equipItem) {
+      const primaryBadge = getProviderBadgeMeta(reports[0].provider);
       return (
-        <a
-          href={val}
-          target="_blank"
-          rel="noopener noreferrer"
-          title={val}
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            onClick={() => setReportModalState({ item: equipItem, tab: 'view' })}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '4px',
+              padding: '3px 8px',
+              fontSize: '11px',
+              fontWeight: 700,
+              borderRadius: '5px',
+              background: primaryBadge.bg,
+              color: primaryBadge.color,
+              border: `1px solid ${primaryBadge.border}`,
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+            }}
+            title={`View ${reports.length} live report(s) inside app modal (${primaryBadge.label})`}
+          >
+            <span>📄 View Live ({reports.length})</span>
+          </button>
+          {isEditor && (
+            <button
+              type="button"
+              onClick={() => setReportModalState({ item: equipItem, tab: 'attach' })}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                padding: '3px 6px',
+                fontSize: '10.5px',
+                fontWeight: 700,
+                borderRadius: '4px',
+                background: '#f0fdf4',
+                color: '#15803d',
+                border: '1px solid #86efac',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+              title="Attach Google Drive / OneDrive report link or upload PDF"
+            >
+              + Report
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    if (drawingRef) {
+      return (
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', flexWrap: 'wrap' }}>
+          <span
+            title={drawingRef}
+            style={{
+              display: 'inline-block',
+              fontSize: '11px',
+              fontWeight: 600,
+              color: '#0f172a',
+              background: '#f1f5f9',
+              border: '1px solid #cbd5e1',
+              padding: '2px 6px',
+              borderRadius: '4px',
+              maxWidth: '150px',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            📄 {drawingRef}
+          </span>
+          {isEditor && equipItem && (
+            <button
+              type="button"
+              onClick={() => setReportModalState({ item: equipItem, tab: 'attach' })}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                padding: '2px 6px',
+                fontSize: '10.5px',
+                fontWeight: 700,
+                borderRadius: '4px',
+                background: '#eff6ff',
+                color: '#0284c7',
+                border: '1px solid #bae6fd',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+              title="Attach Google Drive / OneDrive report or upload PDF"
+            >
+              ⬆️ Attach
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    if (isEditor && equipItem) {
+      return (
+        <button
+          type="button"
+          onClick={() => setReportModalState({ item: equipItem, tab: 'attach' })}
           style={{
             display: 'inline-flex',
             alignItems: 'center',
             gap: '4px',
-            fontWeight: 600,
+            padding: '3px 8px',
             fontSize: '11px',
-            color: 'var(--ac)',
+            fontWeight: 600,
+            borderRadius: '4px',
+            background: '#f8fafc',
+            color: '#0284c7',
+            border: '1px dashed #94a3b8',
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
           }}
+          title="Upload PDF/Image report or attach Google Drive / OneDrive link"
         >
-          📄 Open Doc/Drawing ↗
-        </a>
+          ⬆️ Upload / Link
+        </button>
       );
     }
-    return (
-      <span
-        title={val}
-        style={{
-          display: 'inline-block',
-          fontSize: '11px',
-          fontWeight: 600,
-          color: '#0f172a',
-          background: '#f1f5f9',
-          border: '1px solid #cbd5e1',
-          padding: '2px 6px',
-          borderRadius: '4px',
-          maxWidth: '190px',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        📄 {val}
-      </span>
-    );
+
+    return <span style={{ color: 'var(--mu)' }}>—</span>;
   };
 
   // Unit-wise Progress & Completion Bar Chart (Kitna Hua vs Kitna Baki)
@@ -1031,13 +2101,13 @@ export default function Dashboard() {
     const filtered = treeData.filter((u) => !unitChartSearch || u.name.toLowerCase().includes(unitChartSearch.toLowerCase()));
 
     const unitStats = filtered.map((u) => {
-      // Stage metrics
+      // Stage metrics (excludes Base Line UTG and PMI from percentage calculation)
       let totalApplicableStages = 0;
       let doneStages = 0;
       let openStages = 0;
       let notStartedStages = 0;
       u.items.forEach((item) => {
-        STATUS_COLUMNS.forEach((col) => {
+        PROGRESS_STAGE_COLUMNS.forEach((col) => {
           const val = ((item[col.key] as string) || '').trim().toLowerCase();
           if (val === 'not applicable') return;
           totalApplicableStages++;
@@ -1760,11 +2830,36 @@ export default function Dashboard() {
         <button
           id="mb"
           className="ib"
-          title="Open units menu"
-          aria-label="Open units menu"
-          onClick={() => setTreeOpen(true)}
+          title="Open menu & workspaces"
+          aria-label="Open menu & workspaces"
+          onClick={() => {
+            setTreeOpen((prev) => !prev);
+            setHierarchyOpen(false);
+          }}
         >
           ☰
+        </button>
+        {/* Hierarchy Symbol Button Between Menu and Home */}
+        <button
+          id="hb"
+          className={`ib ${hierarchyOpen ? 'on' : ''}`}
+          title="Units, Sub-Units & Equipment Hierarchy"
+          aria-label="Units, Sub-Units & Equipment Hierarchy"
+          onClick={() => {
+            setHierarchyOpen((prev) => !prev);
+            setTreeOpen(false);
+          }}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '5px',
+            fontSize: '12.5px',
+            fontWeight: 600,
+            cursor: 'pointer',
+          }}
+        >
+          <FolderTree size={15} />
+          <span>Hierarchy</span>
         </button>
         <button
           id="hm"
@@ -1775,10 +2870,10 @@ export default function Dashboard() {
           ⌂ Home
         </button>
         <h1>
-          NRL · NREP Inspection &amp; Acceptance Monitor
+          NRL · NREP Inspection Monitor
           <small id="meta">
             {equipment.length} equipment · {treeData.length} units ·{' '}
-            {treeData.reduce((acc, u) => acc + u.systems.length, 0)} systems
+            {overallUniqueSystems.length} systems
           </small>
         </h1>
 
@@ -1796,8 +2891,8 @@ export default function Dashboard() {
               setTimeout(() => searchInputRef.current?.focus(), 20);
             }}
             style={{
-              padding: '6px 9px',
-              height: '30px',
+              padding: '5px 9px',
+              height: '28px',
               display: searchBoxOpen ? 'none' : 'inline-flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -1941,7 +3036,7 @@ export default function Dashboard() {
                     >
                       <b>{eq.EquipmentTagNo}</b> {eq.EquipmentDescription}
                       <small>
-                        {eq.Unit} › {eq.SystemNo}
+                        {formatEquipmentHierarchyPath(eq)}
                       </small>
                     </a>
                   ))}
@@ -1971,10 +3066,12 @@ export default function Dashboard() {
           hidden
         />
 
-        {/* User Status Badge (Logout moved to footer right corner) */}
+
+        {/* User Status & Assigned Scope Badge (Logout moved to footer right corner) */}
         {(profile || user) && (
-          <span id="who" style={{ fontSize: '12px', opacity: 0.9 }}>
-            {profile?.displayName || user?.email?.split('@')[0] || profile?.email} ·{' '}
+          <span id="who" style={{ fontSize: '12px', opacity: 0.95, display: 'inline-flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+            <span>{profile?.displayName || user?.email?.split('@')[0] || profile?.email}</span>
+            <span>·</span>
             <span
               style={{
                 fontWeight: 700,
@@ -1982,14 +3079,41 @@ export default function Dashboard() {
                 color: isAdmin ? '#fbbf24' : isEditor ? '#86efac' : '#94a3b8',
               }}
             >
-              {profile?.role || 'viewer'}
+              {profile?.role === 'editor' || profile?.role === 'engineer'
+                ? 'inspector'
+                : profile?.role === 'lead_engineer'
+                ? 'lead engineer'
+                : profile?.role || 'viewer'}
+            </span>
+            <span
+              style={{
+                fontSize: '10.5px',
+                fontWeight: 700,
+                padding: '1px 7px',
+                borderRadius: '999px',
+                background: isUnitScoped ? 'rgba(56, 189, 248, 0.22)' : 'rgba(255, 255, 255, 0.14)',
+                color: isUnitScoped ? '#7dd3fc' : '#e2e8f0',
+                border: isUnitScoped
+                  ? '1px solid rgba(56, 189, 248, 0.45)'
+                  : '1px solid rgba(255, 255, 255, 0.25)',
+              }}
+              title="Assigned Unit Scope"
+            >
+              Scope: {isUnitScoped ? allUnitsList.join(', ') : 'All Units'}
             </span>
           </span>
         )}
       </header>
 
-      {/* FLYOUT TREE DRAWER WITH HIERARCHY, TOOLS & ADMIN TABS */}
-      <div id="bk" className={treeOpen ? 'show' : ''} onClick={() => setTreeOpen(false)} />
+      {/* FLYOUT DRAWER BACKDROP (CLOSES BOTH MENU & HIERARCHY DRAWERS) */}
+      <div
+        id="bk"
+        className={(treeOpen || hierarchyOpen) ? 'show' : ''}
+        onClick={() => {
+          setTreeOpen(false);
+          setHierarchyOpen(false);
+        }}
+      />
       <nav id="tree" className={treeOpen ? 'show' : ''} style={{ display: 'flex', flexDirection: 'column' }}>
         {/* Drawer Header */}
         <div
@@ -2015,17 +3139,8 @@ export default function Dashboard() {
           </button>
         </div>
 
-        {/* Vertical Sidebar Navigation: Tasks, 7 Units, 8 UTILITY Sub-Units & Equipment */}
+        {/* Vertical Sidebar Navigation: Tasks & Workspaces */}
         <div style={{ flex: 1, overflowY: 'auto', paddingBottom: '16px' }}>
-          <div style={{ padding: '10px 12px 8px' }}>
-            <input
-              id="tq"
-              placeholder="🔍 Search unit, sub-unit, equipment…"
-              value={treeFilter}
-              onChange={(e) => setTreeFilter(e.target.value)}
-              style={{ width: '100%', boxSizing: 'border-box' }}
-            />
-          </div>
 
           <div
             style={{
@@ -2040,7 +3155,7 @@ export default function Dashboard() {
             Workspace &amp; Tasks
           </div>
 
-          {/* 1. Project Overview (All Units) */}
+          {/* 1. Project Overview (Scoped Units or All Units) */}
           <div
             className={`tn ${viewLevel === 'p' ? 'on' : ''}`}
             onClick={goToHome}
@@ -2053,12 +3168,14 @@ export default function Dashboard() {
                 goToHome();
               }}
             >
-              NREP Project (All 7 Units)
+              {isUnitScoped
+                ? `NREP Scope (${allUnitsList.join(', ')})`
+                : `NREP Project (All ${treeData.length} Units)`}
             </a>
             {renderPill(equipment)}
           </div>
 
-          {/* 2. Excel & Data Tools (Opens in Right Pane) */}
+          {/* 3. Excel & Data Tools (Opens in Right Pane) */}
           <div
             className={`tn ${viewLevel === 'tools' ? 'on' : ''}`}
             onClick={() => {
@@ -2082,314 +3199,242 @@ export default function Dashboard() {
             <span className="pill p-na">Import / Export</span>
           </div>
 
-          {/* 3. Admin & Live Database Console (Opens in Right Pane) */}
-          {(isAdmin || isEditor) && (
-            <div
-              className={`tn ${viewLevel === 'admin' ? 'on' : ''}`}
-              onClick={() => {
-                window.location.hash = 'admin';
-                setViewLevel('admin');
-                setTreeOpen(false);
-              }}
-            >
-              <span className="tg">⚙️</span>
-              <a
-                href="#admin"
-                onClick={(e) => {
-                  e.preventDefault();
-                  window.location.hash = 'admin';
-                  setViewLevel('admin');
-                  setTreeOpen(false);
-                }}
+          {/* 3. Admin & Live Database Console (Hierarchical Tree in Drawer -> Opens Dedicated Sheets in Right Pane) */}
+          {canAccessLiveDatabase && (
+            <div style={{ marginTop: '4px' }}>
+              {/* Root Node: Admin & Live Database */}
+              <div
+                className={`tn ${viewLevel === 'admin' ? 'on' : ''}`}
+                onClick={() => setAdminTreeExpanded((prev) => !prev)}
+                style={{ fontWeight: 700, cursor: 'pointer' }}
               >
-                Admin &amp; Live Database
-              </a>
-              <span className="pill p-ip">Edit / Delete</span>
-            </div>
-          )}
+                <span
+                  className={`tg ${adminTreeExpanded ? 'open' : ''}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setAdminTreeExpanded((prev) => !prev);
+                  }}
+                  title={adminTreeExpanded ? 'Collapse Admin Hierarchy' : 'Expand Admin Hierarchy'}
+                >
+                  ▸
+                </span>
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setAdminTreeExpanded((prev) => !prev);
+                  }}
+                  style={{ display: 'flex', alignItems: 'center', gap: '5px' }}
+                >
+                  <span>⚙️</span>
+                  <span>Admin</span>
+                </a>
+                <span className="pill p-ip">6 Sheets</span>
+              </div>
 
-          {/* Section Header for 7 Units + 8 UTILITY Sub-Units + Equipment */}
-          <div
-            style={{
-              padding: '12px 14px 6px',
-              marginTop: '4px',
-              borderTop: '1px solid var(--bd)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: '6px',
-            }}
-          >
-            <span
-              style={{
-                fontSize: '10px',
-                fontWeight: 700,
-                textTransform: 'uppercase',
-                letterSpacing: '0.6px',
-                color: 'var(--mu)',
-              }}
-            >
-              Units, Sub-Units &amp; Equipment
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                const allUnitIds = treeData.map((u) => u.id);
-                const utilitySysIds = treeData.find((u) => u.name === 'UTILITY')?.systems.map((s) => s.id) || [];
-                if (expandedUnits.size >= allUnitIds.length) {
-                  setExpandedUnits(new Set(['unit-7']));
-                  setExpandedSystems(new Set());
-                } else {
-                  setExpandedUnits(new Set(allUnitIds));
-                  setExpandedSystems(new Set(utilitySysIds));
-                }
-              }}
-              style={{
-                fontSize: '10px',
-                padding: '1px 6px',
-                borderRadius: '4px',
-                border: '1px solid var(--bd)',
-                background: 'var(--tr)',
-                color: 'var(--ac)',
-                fontWeight: 600,
-                cursor: 'pointer',
-              }}
-              title="Expand or Collapse all Units & Sub-Units"
-            >
-              {expandedUnits.size >= treeData.length ? 'Collapse All' : 'Expand All'}
-            </button>
-          </div>
-
-          {/* 7 Main Units -> (For UTILITY: 8 Sub-Units -> Equipment) | (For RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB: Equipment directly inside) */}
-          {treeData.map((u) => {
-            const tf = treeFilter.trim().toLowerCase();
-            const isUtility = u.name === 'UTILITY';
-            const unitMatches = u.name.toLowerCase().includes(tf);
-
-            // For non-UTILITY units: filter equipment directly inside the unit
-            const matchedUnitEquip = u.items.filter(
-              (eq) =>
-                unitMatches ||
-                eq.EquipmentTagNo.toLowerCase().includes(tf) ||
-                (eq.EquipmentDescription || '').toLowerCase().includes(tf)
-            );
-
-            // For UTILITY: filter sub-units and equipment inside each sub-unit
-            const matchedSubUnits = u.systems.filter((s) => {
-              const subMatches = unitMatches || s.name.toLowerCase().includes(tf);
-              const eqMatches = s.items.some(
-                (eq) =>
-                  eq.EquipmentTagNo.toLowerCase().includes(tf) ||
-                  (eq.EquipmentDescription || '').toLowerCase().includes(tf)
-              );
-              return subMatches || eqMatches;
-            });
-
-            if (tf) {
-              if (isUtility && !unitMatches && matchedSubUnits.length === 0) return null;
-              if (!isUtility && !unitMatches && matchedUnitEquip.length === 0) return null;
-            }
-
-            const isUnitExpanded = tf ? true : expandedUnits.has(u.id);
-
-            return (
-              <React.Fragment key={u.id}>
-                {/* LEVEL 1: MAIN UNIT ROW (RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB, UTILITY) */}
+              {/* Hierarchical Tree Branches */}
+              {adminTreeExpanded && (
                 <div
-                  className={`tn l1 ${viewLevel === 'u' && selectedUnitName === u.name ? 'on' : ''}`}
-                  onClick={() => {
-                    window.location.hash = u.id;
-                    setExpandedUnits((prev) => {
-                      const next = new Set(prev);
-                      next.add(u.id);
-                      return next;
-                    });
+                  style={{
+                    marginLeft: '11px',
+                    paddingLeft: '8px',
+                    borderLeft: '1.5px solid #cbd5e1',
+                    marginTop: '2px',
+                    marginBottom: '6px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '2px',
                   }}
                 >
-                  <button
-                    type="button"
-                    className="tg"
-                    title={isUnitExpanded ? `Collapse ${u.name}` : `Expand ${u.name}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setExpandedUnits((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(u.id)) next.delete(u.id);
-                        else next.add(u.id);
-                        return next;
-                      });
-                    }}
-                  >
-                    {isUnitExpanded ? '▾' : '▸'}
-                  </button>
-                  <a
-                    href={`#${u.id}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setExpandedUnits((prev) => new Set([...prev, u.id]));
-                    }}
-                    style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
-                  >
-                    <span>{u.name}</span>
-                    {isUtility ? (
+                  {/* ├─ 1  Live Database */}
+                  <div>
+                    <div
+                      className={`tn ${viewLevel === 'admin' && adminActiveTab === 'database' ? 'on' : ''}`}
+                      style={{ padding: '4px 6px', fontSize: '11.5px' }}
+                      onClick={() => openAdminSheet('database')}
+                    >
                       <span
                         style={{
-                          fontSize: '9.5px',
-                          fontWeight: 700,
-                          padding: '0px 5px',
-                          borderRadius: '4px',
-                          background: '#e0f2fe',
-                          color: '#0369a1',
-                          border: '1px solid #bae6fd',
+                          fontFamily: 'var(--mono)',
+                          fontSize: '10px',
+                          color: '#64748b',
+                          marginRight: '2px',
                         }}
                       >
-                        8 Sub-Units
+                        ├─ 1
                       </span>
-                    ) : (
+                      <a
+                        href="#admin"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          openAdminSheet('database');
+                        }}
+                        style={{ fontWeight: 600 }}
+                      >
+                        Live Database
+                      </a>
+                      <span className="pill p-ok">{equipment.length}</span>
+                    </div>
+                  </div>
+
+                  {/* ├─ 2  Project Structure */}
+                  <div>
+                    <div
+                      className={`tn ${viewLevel === 'admin' && adminActiveTab === 'structure' ? 'on' : ''}`}
+                      style={{ padding: '4px 6px', fontSize: '11.5px' }}
+                      onClick={() => openAdminSheet('structure')}
+                    >
                       <span
                         style={{
-                          fontSize: '9.5px',
-                          fontWeight: 600,
-                          color: 'var(--mu)',
+                          fontFamily: 'var(--mono)',
+                          fontSize: '10px',
+                          color: '#64748b',
+                          marginRight: '2px',
                         }}
                       >
-                        ({u.items.length} eq)
+                        ├─ 2
                       </span>
-                    )}
-                  </a>
-                  {renderPill(u.items)}
-                </div>
+                      <a
+                        href="#admin"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          openAdminSheet('structure');
+                        }}
+                        style={{ fontWeight: 600 }}
+                      >
+                        Project Structure
+                      </a>
+                      <span className="pill p-na">7 Units</span>
+                    </div>
+                  </div>
 
-                {/* IF UNIT IS UTILITY: SHOW 8 SUB-UNITS (DM-CPU, N2U, CA-IA, BOILERS AND HRSG, COOLING TOWER, RWDU, RW FILTER, RW RESERVOIR) -> AND EQUIPMENT INSIDE EACH SUB-UNIT */}
-                {isUnitExpanded &&
-                  isUtility &&
-                  (tf ? matchedSubUnits : u.systems).map((s) => {
-                    const isSubExpanded = tf ? true : expandedSystems.has(s.id);
-                    const subEquipList = tf
-                      ? s.items.filter(
-                          (eq) =>
-                            unitMatches ||
-                            s.name.toLowerCase().includes(tf) ||
-                            eq.EquipmentTagNo.toLowerCase().includes(tf) ||
-                            (eq.EquipmentDescription || '').toLowerCase().includes(tf)
-                        )
-                      : s.items;
-
-                    return (
-                      <React.Fragment key={s.id}>
-                        {/* LEVEL 2 (UNDER UTILITY): SUB-UNIT ROW */}
-                        <div
-                          className={`tn l2 ${
-                            viewLevel === 's' &&
-                            selectedUnitName === u.name &&
-                            selectedSystemName === s.name
-                              ? 'on'
-                              : ''
-                          }`}
-                          onClick={() => {
-                            window.location.hash = s.id;
-                            setExpandedSystems((prev) => new Set([...prev, s.id]));
+                  {/* ├─ 3  Users & Roles */}
+                  {isAdmin && (
+                    <div>
+                      <div
+                        className={`tn ${viewLevel === 'admin' && (adminActiveTab === 'users' || adminActiveTab === 'add') ? 'on' : ''}`}
+                        style={{ padding: '4px 6px', fontSize: '11.5px' }}
+                        onClick={() => openAdminSheet('users')}
+                      >
+                        <span
+                          style={{
+                            fontFamily: 'var(--mono)',
+                            fontSize: '10px',
+                            color: '#64748b',
+                            marginRight: '2px',
                           }}
                         >
-                          <button
-                            type="button"
-                            className="tg"
-                            title={isSubExpanded ? `Collapse ${s.name}` : `Expand equipment in ${s.name}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setExpandedSystems((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(s.id)) next.delete(s.id);
-                                else next.add(s.id);
-                                return next;
-                              });
-                            }}
-                          >
-                            {isSubExpanded ? '▾' : '▸'}
-                          </button>
-                          <a
-                            href={`#${s.id}`}
-                            title={`${s.name} (${s.items.length} Equipment)`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setExpandedSystems((prev) => new Set([...prev, s.id]));
-                            }}
-                            style={{ display: 'flex', alignItems: 'center', gap: '5px' }}
-                          >
-                            <span style={{ fontWeight: 600 }}>{s.name}</span>
-                            <span style={{ fontSize: '9.5px', color: 'var(--mu)' }}>
-                              ({s.items.length} eq)
-                            </span>
-                          </a>
-                          {renderPill(s.items)}
-                        </div>
-
-                        {/* LEVEL 3 (UNDER UTILITY SUB-UNIT): EQUIPMENT ITEMS INSIDE THIS SUB-UNIT */}
-                        {isSubExpanded &&
-                          subEquipList.map((eq) => (
-                            <div
-                              key={eq.id}
-                              className={`tn l3 ${
-                                viewLevel === 'e' && selectedEquipmentTag === eq.EquipmentTagNo ? 'on' : ''
-                              }`}
-                              onClick={() => {
-                                window.location.hash = `eq-${encodeURIComponent(eq.EquipmentTagNo)}`;
-                                setTreeOpen(false);
-                              }}
-                            >
-                              <span style={{ fontSize: '10px', color: 'var(--ac)', flexShrink: 0 }}>•</span>
-                              <a
-                                href={`#eq-${encodeURIComponent(eq.EquipmentTagNo)}`}
-                                title={`${eq.EquipmentTagNo} — ${eq.EquipmentDescription || ''}`}
-                                onClick={() => setTreeOpen(false)}
-                              >
-                                <b style={{ fontSize: '11px' }}>{eq.EquipmentTagNo}</b>
-                                {eq.EquipmentDescription ? (
-                                  <span style={{ color: 'var(--mu)', fontSize: '10.5px', marginLeft: '4px' }}>
-                                    · {eq.EquipmentDescription}
-                                  </span>
-                                ) : null}
-                              </a>
-                              {renderPill([eq])}
-                            </div>
-                          ))}
-                      </React.Fragment>
-                    );
-                  })}
-
-                {/* IF UNIT IS ONE OF THE 6 PROCESS UNITS (RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB): SHOW EQUIPMENT DIRECTLY INSIDE THE UNIT */}
-                {isUnitExpanded &&
-                  !isUtility &&
-                  (tf ? matchedUnitEquip : u.items).map((eq) => (
-                    <div
-                      key={eq.id}
-                      className={`tn l2 ${
-                        viewLevel === 'e' && selectedEquipmentTag === eq.EquipmentTagNo ? 'on' : ''
-                      }`}
-                      onClick={() => {
-                        window.location.hash = `eq-${encodeURIComponent(eq.EquipmentTagNo)}`;
-                        setTreeOpen(false);
-                      }}
-                    >
-                      <span style={{ fontSize: '10px', color: 'var(--ac)', flexShrink: 0 }}>•</span>
-                      <a
-                        href={`#eq-${encodeURIComponent(eq.EquipmentTagNo)}`}
-                        title={`${eq.EquipmentTagNo} — ${eq.EquipmentDescription || ''}`}
-                        onClick={() => setTreeOpen(false)}
-                      >
-                        <b style={{ fontSize: '11.5px' }}>{eq.EquipmentTagNo}</b>
-                        {eq.EquipmentDescription ? (
-                          <span style={{ color: 'var(--mu)', fontSize: '10.5px', marginLeft: '4px' }}>
-                            · {eq.EquipmentDescription}
-                          </span>
-                        ) : null}
-                      </a>
-                      {renderPill([eq])}
+                          ├─ 3
+                        </span>
+                        <a
+                          href="#admin"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            openAdminSheet('users');
+                          }}
+                          style={{ fontWeight: 600 }}
+                        >
+                          Users &amp; Roles
+                        </a>
+                        <span className="pill p-ip">RBAC</span>
+                      </div>
                     </div>
-                  ))}
-              </React.Fragment>
-            );
-          })}
+                  )}
+
+                  {/* ├─ 5  Cloud Report Sync & Drive Switcher (3 modules) */}
+                  <div>
+                    <div
+                      className={`tn ${viewLevel === 'admin' && adminActiveTab === 'cloud' ? 'on' : ''}`}
+                      style={{ padding: '4px 6px', fontSize: '11.5px' }}
+                      onClick={() => openAdminSheet('cloud')}
+                    >
+                      <span
+                        style={{
+                          fontFamily: 'var(--mono)',
+                          fontSize: '10px',
+                          color: '#64748b',
+                          marginRight: '2px',
+                        }}
+                      >
+                        ├─ 5
+                      </span>
+                      <a
+                        href="#admin"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          openAdminSheet('cloud');
+                        }}
+                        style={{ fontWeight: 600, whiteSpace: 'normal', lineHeight: 1.2 }}
+                      >
+                        Cloud Report Sync &amp; Drive Switcher (3 modules)
+                      </a>
+                    </div>
+                  </div>
+
+                  {/* ├─ 6  Audit Trail */}
+                  <div>
+                    <div
+                      className={`tn ${viewLevel === 'admin' && adminActiveTab === 'audit' ? 'on' : ''}`}
+                      style={{ padding: '4px 6px', fontSize: '11.5px' }}
+                      onClick={() => openAdminSheet('audit')}
+                    >
+                      <span
+                        style={{
+                          fontFamily: 'var(--mono)',
+                          fontSize: '10px',
+                          color: '#64748b',
+                          marginRight: '2px',
+                        }}
+                      >
+                        ├─ 6
+                      </span>
+                      <a
+                        href="#admin"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          openAdminSheet('audit');
+                        }}
+                        style={{ fontWeight: 600 }}
+                      >
+                        Audit Trail ({auditLogs.length})
+                      </a>
+                    </div>
+                  </div>
+
+                  {/* └─ 7  Storage & Capacity */}
+                  <div>
+                    <div
+                      className={`tn ${viewLevel === 'admin' && adminActiveTab === 'storage' ? 'on' : ''}`}
+                      style={{ padding: '4px 6px', fontSize: '11.5px' }}
+                      onClick={() => openAdminSheet('storage')}
+                    >
+                      <span
+                        style={{
+                          fontFamily: 'var(--mono)',
+                          fontSize: '10px',
+                          color: '#64748b',
+                          marginRight: '2px',
+                        }}
+                      >
+                        └─ 7
+                      </span>
+                      <a
+                        href="#admin"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          openAdminSheet('storage');
+                        }}
+                        style={{ fontWeight: 600 }}
+                      >
+                        Storage &amp; Capacity
+                      </a>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Drawer Sticky Bottom Footer */}
@@ -2408,14 +3453,10 @@ export default function Dashboard() {
             <span style={{ color: 'var(--mu)', display: 'block', fontSize: '9.5px', textTransform: 'uppercase' }}>Logged in as</span>
             <b style={{ color: 'var(--tx)', fontSize: '11.5px' }}>{profile?.displayName || user?.email?.split('@')[0] || 'User'}</b>
           </div>
-          {(isAdmin || isEditor) ? (
+          {canAccessLiveDatabase ? (
             <button
               type="button"
-              onClick={() => {
-                window.location.hash = 'admin';
-                setViewLevel('admin');
-                setTreeOpen(false);
-              }}
+              onClick={() => openAdminSheet('database')}
               style={{
                 padding: '4px 8px',
                 fontSize: '11px',
@@ -2435,8 +3476,441 @@ export default function Dashboard() {
         </div>
       </nav>
 
+      {/* 2. DEDICATED FLYOUT HIERARCHY DRAWER (UNIT > SUB-UNIT > SYSTEM > SUB-SYSTEM > EQUIPMENT) */}
+      <nav id="hierarchy-tree" className={hierarchyOpen ? 'show' : ''} style={{ display: 'flex', flexDirection: 'column' }}>
+        {/* Drawer Header */}
+        <div
+          className="th"
+          style={{
+            padding: '12px 14px 10px',
+            borderBottom: '1px solid var(--bd)',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
+            <FolderTree size={16} style={{ color: 'var(--ac)' }} />
+            <span style={{ fontWeight: 700, fontSize: '11.5px', color: 'var(--tx)', letterSpacing: '0.3px' }}>
+              UNIT › SUB-UNIT › SYSTEM › SUB-SYSTEM
+            </span>
+          </div>
+          <button
+            className="tg"
+            onClick={() => setHierarchyOpen(false)}
+            aria-label="Close hierarchy"
+            style={{ width: 'auto', fontSize: '16px', cursor: 'pointer' }}
+          >
+            ✕
+          </button>
+        </div>
+
+        {/* Search input for filtering units, sub-units, systems, sub-systems & equipment */}
+        <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--bd)' }}>
+          <input
+            id="tq-hierarchy"
+            placeholder="🔍 Search unit, sub-unit, system, sub-system, tag…"
+            value={treeFilter}
+            onChange={(e) => setTreeFilter(e.target.value)}
+            style={{ width: '100%', boxSizing: 'border-box' }}
+          />
+        </div>
+
+        {/* Scrollable Hierarchy Tree Wrapper */}
+        <div style={{ flex: 1, overflowY: 'auto', paddingBottom: '16px' }}>
+          {/* Section Header for Expand / Collapse All */}
+          <div
+            style={{
+              padding: '10px 14px 6px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '6px',
+            }}
+          >
+            <span
+              style={{
+                fontSize: '10px',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                letterSpacing: '0.6px',
+                color: 'var(--mu)',
+              }}
+            >
+              Interactive Hierarchy Tree
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                const allUnitIds = treeData.map((u) => u.id);
+                const allSysIds = treeData.flatMap((u) => u.systems.map((s) => s.id));
+                if (expandedUnits.size > 0 || expandedSystems.size > 0) {
+                  setExpandedUnits(new Set());
+                  setExpandedSystems(new Set());
+                } else {
+                  setExpandedUnits(new Set(allUnitIds));
+                  setExpandedSystems(new Set(allSysIds));
+                }
+              }}
+              style={{
+                fontSize: '10px',
+                padding: '1px 6px',
+                borderRadius: '4px',
+                border: '1px solid var(--bd)',
+                background: 'var(--tr)',
+                color: 'var(--ac)',
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+              title="Expand or Collapse all Units, Sub-Units, Systems & Sub-Systems"
+            >
+              {expandedUnits.size > 0 || expandedSystems.size > 0 ? 'Collapse All' : 'Expand All'}
+            </button>
+          </div>
+
+          {/* Recursive 4-Level Skip-Aware Tree Renderer */}
+          {(() => {
+            const tf = treeFilter.trim().toLowerCase();
+            const hasDropdownFilter = Boolean(
+              hierUnitDropdown || hierSubUnitDropdown || hierSystemDropdown || hierSubSystemDropdown
+            );
+
+            const itemMatchesSearchAndDropdown = (eq: EquipmentItem, unitMatches: boolean) => {
+              if (hierSubUnitDropdown && (eq.SubUnit || '') !== hierSubUnitDropdown) return false;
+              if (hierSystemDropdown && (eq.SystemNo || '') !== hierSystemDropdown) return false;
+              if (hierSubSystemDropdown && (eq.SubSystem || '') !== hierSubSystemDropdown) return false;
+              if (!tf) return true;
+              return (
+                unitMatches ||
+                eq.EquipmentTagNo.toLowerCase().includes(tf) ||
+                (eq.EquipmentDescription || '').toLowerCase().includes(tf) ||
+                (eq.SubUnit || '').toLowerCase().includes(tf) ||
+                (eq.SystemNo || '').toLowerCase().includes(tf) ||
+                (eq.SubSystem || '').toLowerCase().includes(tf)
+              );
+            };
+
+            const nodeMatchesRecursive = (node: HierarchyTreeNode, unitMatches: boolean): boolean => {
+              if (hierSubUnitDropdown && node.levelType === 'subunit' && node.name !== hierSubUnitDropdown) {
+                return false;
+              }
+              if (hierSystemDropdown && node.levelType === 'system' && node.name !== hierSystemDropdown) {
+                return false;
+              }
+              if (hierSubSystemDropdown && node.levelType === 'subsystem' && node.name !== hierSubSystemDropdown) {
+                return false;
+              }
+              const selfTextMatches = !tf || unitMatches || node.name.toLowerCase().includes(tf);
+              const anyDirectEqMatches = node.directItems.some((eq) =>
+                itemMatchesSearchAndDropdown(eq, unitMatches || selfTextMatches)
+              );
+              const anyChildMatches = node.children.some((c) =>
+                nodeMatchesRecursive(c, unitMatches || selfTextMatches)
+              );
+              if (hierSubSystemDropdown && node.levelType !== 'subsystem') {
+                return anyChildMatches;
+              }
+              if (hierSystemDropdown && node.levelType === 'subunit') {
+                return anyChildMatches;
+              }
+              if (!tf && !hasDropdownFilter) return true;
+              return (selfTextMatches && !hierSubSystemDropdown && !(hierSystemDropdown && node.levelType === 'subunit')) || anyDirectEqMatches || anyChildMatches;
+            };
+
+            const renderHierarchyNode = (
+              u: (typeof treeData)[number],
+              node: HierarchyTreeNode,
+              depth: number,
+              unitMatches: boolean
+            ): React.ReactNode => {
+              if (!nodeMatchesRecursive(node, unitMatches)) return null;
+
+              const isNodeExpanded = expandedSystems.has(node.id);
+              const selfMatches = !tf || unitMatches || node.name.toLowerCase().includes(tf);
+              const visibleDirectItems = node.directItems.filter((eq) =>
+                itemMatchesSearchAndDropdown(eq, selfMatches)
+              );
+
+              const badgeColors =
+                node.levelType === 'subunit'
+                  ? { bg: '#e0f2fe', color: '#0369a1', border: '#bae6fd' }
+                  : node.levelType === 'system'
+                  ? { bg: '#f0fdf4', color: '#166534', border: '#bbf7d0' }
+                  : { bg: '#eef2ff', color: '#3730a3', border: '#c7d2fe' };
+
+              return (
+                <React.Fragment key={node.id}>
+                  <div
+                    className={`tn l2 ${
+                      viewLevel === 's' && selectedUnitName === u.name && activeSystem?.id === node.id
+                        ? 'on'
+                        : ''
+                    }`}
+                    style={{ paddingLeft: `${14 + depth * 14}px` }}
+                    onClick={() => {
+                      setExpandedSystems((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(node.id)) next.delete(node.id);
+                        else next.add(node.id);
+                        return next;
+                      });
+                    }}
+                  >
+                    <button
+                      type="button"
+                      className="tg"
+                      title={isNodeExpanded ? `Collapse ${node.name}` : `Expand ${node.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setExpandedSystems((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(node.id)) next.delete(node.id);
+                          else next.add(node.id);
+                          return next;
+                        });
+                      }}
+                    >
+                      {isNodeExpanded ? '▾' : '▸'}
+                    </button>
+                    <a
+                      href={`#${node.id}`}
+                      title={`${node.levelBadge}: ${node.pathLabel} (${node.items.length} Equipment)`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                      }}
+                      style={{ display: 'flex', alignItems: 'center', gap: '5px', flexWrap: 'wrap' }}
+                    >
+                      <span
+                        style={{
+                          fontSize: '8.5px',
+                          fontWeight: 700,
+                          padding: '0px 4px',
+                          borderRadius: '3px',
+                          background: badgeColors.bg,
+                          color: badgeColors.color,
+                          border: `1px solid ${badgeColors.border}`,
+                          textTransform: 'uppercase',
+                        }}
+                      >
+                        {node.levelBadge}
+                      </span>
+                      <span style={{ fontWeight: 600 }}>{node.name}</span>
+                      <span style={{ fontSize: '9.5px', color: 'var(--mu)' }}>
+                        ({node.items.length} eq)
+                      </span>
+                    </a>
+                    {renderPill(node.items)}
+                  </div>
+
+                  {/* Child Hierarchy Nodes (e.g. System under Sub-Unit, or Sub-System under System) */}
+                  {isNodeExpanded &&
+                    node.children.map((child) =>
+                      renderHierarchyNode(u, child, depth + 1, selfMatches)
+                    )}
+
+                  {/* Direct Equipment attached at this node (when lower hierarchy levels are blank/skipped) */}
+                  {isNodeExpanded &&
+                    visibleDirectItems.map((eq) => (
+                      <div
+                        key={eq.id}
+                        className={`tn l3 ${
+                          viewLevel === 'e' && selectedEquipmentTag === eq.EquipmentTagNo ? 'on' : ''
+                        }`}
+                        style={{ paddingLeft: `${26 + depth * 14}px` }}
+                        onClick={() => {
+                          window.location.hash = `eq-${encodeURIComponent(eq.EquipmentTagNo)}`;
+                          setTreeOpen(false);
+                          setHierarchyOpen(false);
+                        }}
+                      >
+                        <span style={{ fontSize: '10px', color: 'var(--ac)', flexShrink: 0 }}>•</span>
+                        <a
+                          href={`#eq-${encodeURIComponent(eq.EquipmentTagNo)}`}
+                          title={`${eq.EquipmentTagNo} — ${eq.EquipmentDescription || ''}`}
+                          onClick={() => {
+                            setTreeOpen(false);
+                            setHierarchyOpen(false);
+                          }}
+                        >
+                          <b style={{ fontSize: '11px' }}>{eq.EquipmentTagNo}</b>
+                          {eq.EquipmentDescription ? (
+                            <span style={{ color: 'var(--mu)', fontSize: '10.5px', marginLeft: '4px' }}>
+                              · {eq.EquipmentDescription}
+                            </span>
+                          ) : null}
+                        </a>
+                        {renderPill([eq])}
+                      </div>
+                    ))}
+                </React.Fragment>
+              );
+            };
+
+            return treeData
+              .filter((u) => !hierUnitDropdown || u.name === hierUnitDropdown)
+              .map((u) => {
+                const unitMatches = !tf || u.name.toLowerCase().includes(tf);
+                const visibleDirectUnitEquip =
+                  !hierSubUnitDropdown && !hierSystemDropdown && !hierSubSystemDropdown
+                    ? u.directItems.filter((eq) => itemMatchesSearchAndDropdown(eq, unitMatches))
+                    : [];
+                const visibleChildren = u.children.filter((c) => nodeMatchesRecursive(c, unitMatches));
+
+                if ((tf || hasDropdownFilter) && !unitMatches && visibleDirectUnitEquip.length === 0 && visibleChildren.length === 0) {
+                  return null;
+                }
+
+                const isUnitExpanded = expandedUnits.has(u.id);
+
+                return (
+                  <React.Fragment key={u.id}>
+                    {/* LEVEL 1: MAIN UNIT ROW */}
+                    <div
+                      className={`tn l1 ${viewLevel === 'u' && selectedUnitName === u.name ? 'on' : ''}`}
+                      onClick={() => {
+                        setExpandedUnits((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(u.id)) next.delete(u.id);
+                          else next.add(u.id);
+                          return next;
+                        });
+                      }}
+                    >
+                      <button
+                        type="button"
+                        className="tg"
+                        title={isUnitExpanded ? `Collapse ${u.name}` : `Expand ${u.name}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExpandedUnits((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(u.id)) next.delete(u.id);
+                            else next.add(u.id);
+                            return next;
+                          });
+                        }}
+                      >
+                        {isUnitExpanded ? '▾' : '▸'}
+                      </button>
+                      <a
+                        href={`#${u.id}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                        }}
+                        style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}
+                      >
+                        <span>{u.name}</span>
+                        {u.children.length > 0 && (
+                          <span
+                            style={{
+                              fontSize: '9.5px',
+                              fontWeight: 700,
+                              padding: '0px 5px',
+                              borderRadius: '4px',
+                              background: '#e0f2fe',
+                              color: '#0369a1',
+                              border: '1px solid #bae6fd',
+                            }}
+                          >
+                            {u.children.length} {u.children[0]?.levelBadge || 'Sub-Unit'}
+                            {u.children.length > 1 ? 's' : ''}
+                          </span>
+                        )}
+                        <span
+                          style={{
+                            fontSize: '9.5px',
+                            fontWeight: 600,
+                            color: 'var(--mu)',
+                          }}
+                        >
+                          ({u.items.length} eq)
+                        </span>
+                      </a>
+                      {renderPill(u.items)}
+                    </div>
+
+                    {/* Child Hierarchy Nodes (Sub-Unit > System > Sub-System) */}
+                    {isUnitExpanded &&
+                      u.children.map((child) => renderHierarchyNode(u, child, 1, unitMatches))}
+
+                    {/* Direct Equipment under Unit (when Sub-Unit, System, and Sub-System were all skipped/blank) */}
+                    {isUnitExpanded &&
+                      visibleDirectUnitEquip.map((eq) => (
+                        <div
+                          key={eq.id}
+                          className={`tn l2 ${
+                            viewLevel === 'e' && selectedEquipmentTag === eq.EquipmentTagNo ? 'on' : ''
+                          }`}
+                          onClick={() => {
+                            window.location.hash = `eq-${encodeURIComponent(eq.EquipmentTagNo)}`;
+                            setTreeOpen(false);
+                            setHierarchyOpen(false);
+                          }}
+                        >
+                          <span style={{ fontSize: '10px', color: 'var(--ac)', flexShrink: 0 }}>•</span>
+                          <a
+                            href={`#eq-${encodeURIComponent(eq.EquipmentTagNo)}`}
+                            title={`${eq.EquipmentTagNo} — ${eq.EquipmentDescription || ''}`}
+                            onClick={() => {
+                              setTreeOpen(false);
+                              setHierarchyOpen(false);
+                            }}
+                          >
+                            <b style={{ fontSize: '11.5px' }}>{eq.EquipmentTagNo}</b>
+                            {eq.EquipmentDescription ? (
+                              <span style={{ color: 'var(--mu)', fontSize: '10.5px', marginLeft: '4px' }}>
+                                · {eq.EquipmentDescription}
+                              </span>
+                            ) : null}
+                          </a>
+                          {renderPill([eq])}
+                        </div>
+                      ))}
+                  </React.Fragment>
+                );
+              });
+          })()}
+        </div>
+
+        {/* Hierarchy Drawer Sticky Bottom Summary */}
+        <div
+          style={{
+            borderTop: '1px solid var(--bd)',
+            background: 'var(--tr)',
+            padding: '10px 12px',
+            fontSize: '11px',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+          }}
+        >
+          <span style={{ color: 'var(--mu)', fontSize: '10.5px' }}>
+            Skip-Aware 4-Level Hierarchy
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              goToHome();
+              setHierarchyOpen(false);
+            }}
+            style={{
+              padding: '3px 8px',
+              fontSize: '10.5px',
+              fontWeight: 600,
+              background: 'var(--ac)',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+            }}
+          >
+            ⌂ Back to Home
+          </button>
+        </div>
+      </nav>
+
       {/* MAIN VIEWPORT MATCHING REFERENCE HTML */}
-      <main id="main" className="nrep-main">
+      <main id="main" className={`nrep-main ${viewLevel === 'admin' ? '!p-0 !max-w-none w-full' : ''}`}>
         {/* LEVEL 1: PROJECT OVERALL STATUS */}
         {viewLevel === 'p' && (
           <>
@@ -2504,7 +3978,9 @@ export default function Dashboard() {
                           }}
                         >
                           NREP Project –{' '}
-                          <span style={{ color: '#67b7f7' }}>Overall Status</span>
+                          <span style={{ color: '#67b7f7' }}>
+                            {isUnitScoped ? `${allUnitsList.join(', ')} Unit Status` : 'Overall Status'}
+                          </span>
                         </div>
 
                         {/* Live Status Badge */}
@@ -2665,7 +4141,7 @@ export default function Dashboard() {
 
             {/* Professional Executive KPI Cards Strip */}
             {(() => {
-              const totalSystems = treeData.reduce((acc, u) => acc + u.systems.length, 0);
+              const totalSystems = overallUniqueSystems.length;
               const compPct = stats.total ? Math.round((stats.completed / stats.total) * 100) : 0;
               const progPct = stats.total ? Math.round((stats.inProgress / stats.total) * 100) : 0;
               const notStartPct = stats.total ? Math.round((stats.notStarted / stats.total) * 100) : 0;
@@ -2673,10 +4149,10 @@ export default function Dashboard() {
               return (
                 <div className="kp">
                   {renderProfessionalKpiCard({
-                    label: 'Units',
-                    value: treeData.length,
-                    subtext: 'Process & utility units',
-                    badgeText: 'Scope',
+                    label: isUnitScoped ? 'Assigned Unit' : 'Units',
+                    value: isUnitScoped && treeData.length === 1 ? treeData[0].name : treeData.length,
+                    subtext: isUnitScoped ? `Scoped to ${allUnitsList.join(', ')}` : 'Process & utility units',
+                    badgeText: isUnitScoped ? 'Assigned' : 'Scope',
                     pctBar: 100,
                     theme: 'navy',
                     icon: <Factory size={13} />,
@@ -2691,7 +4167,7 @@ export default function Dashboard() {
                   {renderProfessionalKpiCard({
                     label: 'Systems',
                     value: totalSystems,
-                    subtext: `Across ${treeData.length} project units`,
+                    subtext: `${totalSystems} unique systems in System column`,
                     badgeText: 'Active',
                     pctBar: 100,
                     theme: 'indigo',
@@ -2701,7 +4177,7 @@ export default function Dashboard() {
                       setKpiSearch('');
                       setKpiFilter(kpiFilter === 'systems' ? null : 'systems');
                     },
-                    title: 'Click to drill down into Systems breakdown',
+                    title: 'Click to drill down into unique Systems from System column',
                   })}
 
                   {renderProfessionalKpiCard({
@@ -2795,7 +4271,7 @@ export default function Dashboard() {
                     {kpiFilter === 'units'
                       ? `Units Breakdown (${treeData.length} units)`
                       : kpiFilter === 'systems'
-                      ? `Systems Breakdown (${treeData.reduce((acc, u) => acc + u.systems.length, 0)} systems)`
+                      ? `Systems Breakdown (${overallUniqueSystems.length} unique systems)`
                       : kpiFilter === 'prog'
                       ? 'Stage-Wise Status Overview — All Units'
                       : kpiFilter === 'Completed'
@@ -2806,17 +4282,6 @@ export default function Dashboard() {
                       ? `Equipment Not Started (${stats.notStarted})`
                       : `All Equipment (${stats.total})`}
                   </h3>
-                  <button
-                    className="x"
-                    onClick={() => {
-                      setKpiFilter(null);
-                      setKpiSearch('');
-                    }}
-                    title="Close filter and restore home page overview"
-                    style={{ fontWeight: 600, padding: '4px 10px', fontSize: '12px' }}
-                  >
-                    ✕ Close &amp; Show Full Overview
-                  </button>
                 </div>
 
                 {kpiFilter === 'units' && (
@@ -2842,10 +4307,20 @@ export default function Dashboard() {
                             <th>Completed</th>
                             <th>In prog.</th>
                             <th>Not started</th>
-                            <th style={{ minWidth: '150px' }}>Status</th>
+                            <th style={{ minWidth: '150px' }}>Stage Progress</th>
                             {STATUS_COLUMNS.map((col) => (
-                              <th key={col.key} className="ct">
-                                {col.short}
+                              <th
+                                key={col.key}
+                                className="ct"
+                                title={`Work completed / issued count (${col.doneValue})`}
+                                style={{ minWidth: '82px', textAlign: 'center' }}
+                              >
+                                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px', width: '100%' }}>
+                                  <span style={{ textAlign: 'center' }}>{col.short}</span>
+                                  <span style={{ fontSize: '9px', textTransform: 'none', color: '#0369a1', fontWeight: 700, textAlign: 'center' }}>
+                                    ({col.doneValue})
+                                  </span>
+                                </div>
                               </th>
                             ))}
                           </tr>
@@ -2863,20 +4338,79 @@ export default function Dashboard() {
                               return (
                                 <tr key={u.id}>
                                   <td>
-                                    <a href={`#${u.id}`}>
+                                    <a href={`#${u.id}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
                                       <b>{u.name}</b>
+                                      {u.name === 'UTILITY' && (
+                                        <span
+                                          style={{
+                                            fontSize: '9.5px',
+                                            fontWeight: 700,
+                                            padding: '1px 5px',
+                                            borderRadius: '4px',
+                                            background: '#e0f2fe',
+                                            color: '#0369a1',
+                                            border: '1px solid #bae6fd',
+                                          }}
+                                        >
+                                          8 Sub-Units
+                                        </span>
+                                      )}
+                                      {u.name === 'MSP' && (
+                                        <span
+                                          style={{
+                                            fontSize: '9.5px',
+                                            fontWeight: 700,
+                                            padding: '1px 5px',
+                                            borderRadius: '4px',
+                                            background: '#f0fdf4',
+                                            color: '#166534',
+                                            border: '1px solid #bbf7d0',
+                                          }}
+                                        >
+                                          3 Sub-Units
+                                        </span>
+                                      )}
                                     </a>
                                   </td>
-                                  <td>{s.total}</td>
-                                  <td>{s.completed}</td>
-                                  <td>{s.inProgress}</td>
-                                  <td>{n}</td>
+                                  <td><b>{s.total}</b></td>
+                                  <td><span style={{ color: '#166534', fontWeight: 600 }}>{s.completed}</span></td>
+                                  <td><span style={{ color: '#0369a1', fontWeight: 600 }}>{s.inProgress}</span></td>
+                                  <td><span style={{ color: '#64748b' }}>{n}</span></td>
                                   <td>{renderMiniProgressBar(u.items)}</td>
                                   {STATUS_COLUMNS.map((col) => {
-                                    const pend = getPendingStageCount(u.items, col.key);
+                                    const done = getDoneStageCount(u.items, col.key);
+                                    const total = u.items.length;
+                                    const isAllDone = total > 0 && done === total;
+                                    const isPartDone = done > 0 && !isAllDone;
                                     return (
-                                      <td key={col.key} className={pend ? 'pn' : 'pz'}>
-                                        {pend}
+                                      <td
+                                        key={col.key}
+                                        className="ct"
+                                        style={{ textAlign: 'center' }}
+                                        title={`${u.name} — ${col.short}: ${done} of ${total} completed (${col.doneValue})`}
+                                      >
+                                        <span
+                                          style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            minWidth: '24px',
+                                            height: '20px',
+                                            padding: '0 6px',
+                                            borderRadius: '4px',
+                                            fontSize: '11px',
+                                            fontWeight: 700,
+                                            background: isAllDone ? '#dcfce7' : isPartDone ? '#e0f2fe' : '#f1f5f9',
+                                            color: isAllDone ? '#166534' : isPartDone ? '#0284c7' : '#64748b',
+                                            border: isAllDone
+                                              ? '1px solid #bbf7d0'
+                                              : isPartDone
+                                              ? '1px solid #bae6fd'
+                                              : '1px solid #e2e8f0',
+                                          }}
+                                        >
+                                          {done}
+                                        </span>
                                       </td>
                                     );
                                   })}
@@ -2885,6 +4419,9 @@ export default function Dashboard() {
                             })}
                         </tbody>
                       </table>
+                    </div>
+                    <div className="note" style={{ marginTop: '8px' }}>
+                      Stage columns show work completed/issued counts (Format-I/II/III/IV/V = Issued, Internal Insp. = Yes, Base Line UTG = Yes, PMI = Yes, Final Accept. = Accepted).
                     </div>
                   </div>
                 )}
@@ -2909,43 +4446,92 @@ export default function Dashboard() {
                             <th>Completed</th>
                             <th>In prog.</th>
                             <th>Not started</th>
-                            <th style={{ minWidth: '150px' }}>Status</th>
+                            <th style={{ minWidth: '150px' }}>Stage Progress</th>
                             {STATUS_COLUMNS.map((col) => (
-                              <th key={col.key} className="ct">
-                                {col.short}
+                              <th
+                                key={col.key}
+                                className="ct"
+                                title={`Work completed / issued count (${col.doneValue})`}
+                                style={{ minWidth: '82px', textAlign: 'center' }}
+                              >
+                                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px', width: '100%' }}>
+                                  <span style={{ textAlign: 'center' }}>{col.short}</span>
+                                  <span style={{ fontSize: '9px', textTransform: 'none', color: '#0369a1', fontWeight: 700, textAlign: 'center' }}>
+                                    ({col.doneValue})
+                                  </span>
+                                </div>
                               </th>
                             ))}
                           </tr>
                         </thead>
                         <tbody>
-                          {treeData
-                            .flatMap((u) => u.systems.map((sys) => ({ u, sys })))
-                            .filter(({ u, sys }) => {
+                          {overallUniqueSystems
+                            .filter((sys) => {
                               if (!kpiSearch) return true;
                               const q = kpiSearch.toLowerCase();
-                              return sys.name.toLowerCase().includes(q) || u.name.toLowerCase().includes(q);
+                              return (
+                                sys.systemName.toLowerCase().includes(q) ||
+                                sys.unit.toLowerCase().includes(q) ||
+                                (sys.subUnit && sys.subUnit.toLowerCase().includes(q))
+                              );
                             })
-                            .map(({ u, sys }) => {
+                            .map((sys) => {
                               const c = sys.items.filter((r) => getEquipmentOverallStatus(r) === 'Completed').length;
                               const p = sys.items.filter((r) => getEquipmentOverallStatus(r) === 'In progress').length;
                               const n = sys.items.length - c - p;
                               return (
-                                <tr key={sys.id}>
+                                <tr key={sys.key}>
                                   <td>
-                                    <a href={`#${sys.id}`}>
-                                      <b>{u.name} › {sys.name}</b>
-                                    </a>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                      <span style={{ fontWeight: 700, color: 'var(--tx)' }}>
+                                        {sys.unit} › {sys.systemName}
+                                      </span>
+                                      {sys.subUnit && (
+                                        <span style={{ fontSize: '10px', color: '#0369a1', fontWeight: 600 }}>
+                                          Sub-Unit: {sys.subUnit}
+                                        </span>
+                                      )}
+                                    </div>
                                   </td>
-                                  <td>{sys.items.length}</td>
-                                  <td>{c}</td>
-                                  <td>{p}</td>
-                                  <td>{n}</td>
+                                  <td><b>{sys.items.length}</b></td>
+                                  <td><span style={{ color: '#166534', fontWeight: 600 }}>{c}</span></td>
+                                  <td><span style={{ color: '#0369a1', fontWeight: 600 }}>{p}</span></td>
+                                  <td><span style={{ color: '#64748b' }}>{n}</span></td>
                                   <td>{renderMiniProgressBar(sys.items)}</td>
                                   {STATUS_COLUMNS.map((col) => {
-                                    const pend = getPendingStageCount(sys.items, col.key);
+                                    const done = getDoneStageCount(sys.items, col.key);
+                                    const total = sys.items.length;
+                                    const isAllDone = total > 0 && done === total;
+                                    const isPartDone = done > 0 && !isAllDone;
                                     return (
-                                      <td key={col.key} className={pend ? 'pn' : 'pz'}>
-                                        {pend}
+                                      <td
+                                        key={col.key}
+                                        className="ct"
+                                        style={{ textAlign: 'center' }}
+                                        title={`${sys.unit} › ${sys.systemName} — ${col.short}: ${done} of ${total} completed (${col.doneValue})`}
+                                      >
+                                        <span
+                                          style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            minWidth: '24px',
+                                            height: '20px',
+                                            padding: '0 6px',
+                                            borderRadius: '4px',
+                                            fontSize: '11px',
+                                            fontWeight: 700,
+                                            background: isAllDone ? '#dcfce7' : isPartDone ? '#e0f2fe' : '#f1f5f9',
+                                            color: isAllDone ? '#166534' : isPartDone ? '#0284c7' : '#64748b',
+                                            border: isAllDone
+                                              ? '1px solid #bbf7d0'
+                                              : isPartDone
+                                              ? '1px solid #bae6fd'
+                                              : '1px solid #e2e8f0',
+                                          }}
+                                        >
+                                          {done}
+                                        </span>
                                       </td>
                                     );
                                   })}
@@ -2954,6 +4540,9 @@ export default function Dashboard() {
                             })}
                         </tbody>
                       </table>
+                    </div>
+                    <div className="note" style={{ marginTop: '8px' }}>
+                      Stage columns show work completed/issued counts (Format-I/II/III/IV/V = Issued, Internal Insp. = Yes, Base Line UTG = Yes, PMI = Yes, Final Accept. = Accepted).
                     </div>
                   </div>
                 )}
@@ -2970,122 +4559,121 @@ export default function Dashboard() {
 
                 {['all', 'Completed', 'In progress', 'Not started'].includes(kpiFilter) && (
                   <div>
-                    <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap' }}>
-                      <input
-                        className="tsf"
-                        style={{ maxWidth: '340px', margin: 0 }}
-                        placeholder="🔍 Search tag, description, unit, system…"
-                        value={kpiSearch}
-                        onChange={(e) => setKpiSearch(e.target.value)}
-                      />
-                      <span style={{ fontSize: '12px', color: 'var(--mu)' }}>
-                        Showing {
-                          equipment.filter((r) => {
-                            const matchesFilter = kpiFilter === 'all' || getEquipmentOverallStatus(r) === kpiFilter;
-                            if (!matchesFilter) return false;
-                            if (!kpiSearch) return true;
-                            const q = kpiSearch.toLowerCase();
-                            return (
-                              r.EquipmentTagNo?.toLowerCase().includes(q) ||
-                              r.EquipmentDescription?.toLowerCase().includes(q) ||
-                              r.Unit?.toLowerCase().includes(q) ||
-                              r.SystemNo?.toLowerCase().includes(q)
-                            );
-                          }).length
-                        } equipment
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setKpiFilter(null);
-                          setKpiSearch('');
-                        }}
-                        style={{
-                          marginLeft: 'auto',
-                          fontSize: '12px',
-                          padding: '4px 10px',
-                          background: 'var(--tr)',
-                          borderColor: 'var(--bd)',
-                        }}
-                      >
-                        ✕ Close &amp; Show Full Home Overview
-                      </button>
-                    </div>
+                    {(() => {
+                      const statusScopedKpiItems = equipment.filter(
+                        (r) => kpiFilter === 'all' || getEquipmentOverallStatus(r) === kpiFilter
+                      );
+                      const availableTypes = getAvailableEquipmentTypes(statusScopedKpiItems);
+                      const filteredKpiEquip = statusScopedKpiItems.filter((r) => {
+                        if (kpiTypeFilter && (r.EquipmentType || '').trim() !== kpiTypeFilter) return false;
+                        if (!kpiSearch) return true;
+                        const q = kpiSearch.toLowerCase();
+                        return (
+                          r.EquipmentTagNo?.toLowerCase().includes(q) ||
+                          r.EquipmentDescription?.toLowerCase().includes(q) ||
+                          r.EquipmentType?.toLowerCase().includes(q) ||
+                          r.Unit?.toLowerCase().includes(q) ||
+                          r.SystemNo?.toLowerCase().includes(q) ||
+                          r.BaseLineUTG?.toLowerCase().includes(q) ||
+                          r.PMI?.toLowerCase().includes(q) ||
+                          r.DocumentDrawing?.toLowerCase().includes(q)
+                        );
+                      });
+                      const effectiveSize = equipPageSize > 0 ? equipPageSize : filteredKpiEquip.length || 1;
+                      const safePage = Math.min(equipPage, Math.max(1, Math.ceil(filteredKpiEquip.length / effectiveSize)));
+                      const pagedKpiEquip =
+                        equipPageSize > 0
+                          ? filteredKpiEquip.slice((safePage - 1) * effectiveSize, safePage * effectiveSize)
+                          : filteredKpiEquip;
 
-                    <div className="tw">
-                      <table className="nrep-table">
-                        <thead>
-                          <tr>
-                            <th>Tag No.</th>
-                            <th>Description</th>
-                            <th>Unit</th>
-                            <th>System</th>
-                            <th>Status</th>
-                            <th>Progress</th>
-                            <th>Base Line UTG</th>
-                            <th>Document/Drawing</th>
-                            {isEditor && <th style={{ textAlign: 'center' }}>Action</th>}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {equipment
-                            .filter((r) => {
-                              const matchesFilter = kpiFilter === 'all' || getEquipmentOverallStatus(r) === kpiFilter;
-                              if (!matchesFilter) return false;
-                              if (!kpiSearch) return true;
-                              const q = kpiSearch.toLowerCase();
-                              return (
-                                r.EquipmentTagNo?.toLowerCase().includes(q) ||
-                                r.EquipmentDescription?.toLowerCase().includes(q) ||
-                                r.Unit?.toLowerCase().includes(q) ||
-                                r.SystemNo?.toLowerCase().includes(q) ||
-                                r.BaseLineUTG?.toLowerCase().includes(q) ||
-                                r.DocumentDrawing?.toLowerCase().includes(q)
-                              );
-                            })
-                            .map((r) => (
-                              <tr key={r.id}>
-                                <td>
-                                  <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
-                                    <b>{r.EquipmentTagNo}</b>
-                                  </a>
-                                </td>
-                                <td>{r.EquipmentDescription || '—'}</td>
-                                <td>{r.Unit}</td>
-                                <td>{r.SystemNo}</td>
-                                <td>{renderStatusChip(getEquipmentOverallStatus(r))}</td>
-                                <td>{calculateProgress([r])}%</td>
-                                <td>{renderStatusChip(r.BaseLineUTG)}</td>
-                                <td>{renderDocumentDrawing(r.DocumentDrawing)}</td>
-                                {isEditor && (
-                                  <td style={{ textAlign: 'center' }}>
-                                    <button
-                                      type="button"
-                                      onClick={() => setEditingEquipment(r)}
-                                      style={{
-                                        display: 'inline-flex',
-                                        alignItems: 'center',
-                                        gap: '3px',
-                                        padding: '3px 8px',
-                                        fontSize: '11px',
-                                        fontWeight: 600,
-                                        background: 'var(--tr)',
-                                        color: 'var(--ac)',
-                                        border: '1px solid var(--bd)',
-                                        borderRadius: '4px',
-                                        cursor: 'pointer',
-                                      }}
-                                      title={`Edit ${r.EquipmentTagNo}`}
-                                    >
-                                      <span>✏️</span> Edit
-                                    </button>
-                                  </td>
-                                )}
-                              </tr>
-                            ))}
-                        </tbody>
-                      </table>
-                    </div>
+                      return (
+                        <>
+                          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap' }}>
+                            <input
+                              className="tsf"
+                              style={{ maxWidth: '340px', margin: 0 }}
+                              placeholder="🔍 Search tag, description, type, unit, system…"
+                              value={kpiSearch}
+                              onChange={(e) => setKpiSearch(e.target.value)}
+                            />
+                            <select
+                              value={kpiTypeFilter}
+                              onChange={(e) => setKpiTypeFilter(e.target.value)}
+                              style={{
+                                padding: '6px 10px',
+                                fontSize: '12px',
+                                borderRadius: '6px',
+                                border: '1px solid var(--bd)',
+                                background: '#ffffff',
+                                color: 'var(--tx)',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                              }}
+                              title="Filter by Equipment Type"
+                            >
+                              <option value="">All Types ({availableTypes.length})</option>
+                              {availableTypes.map(({ type, count }) => (
+                                <option key={type} value={type}>
+                                  {type} ({count})
+                                </option>
+                              ))}
+                            </select>
+                            <span style={{ fontSize: '12px', color: 'var(--mu)' }}>
+                              Showing {filteredKpiEquip.length} equipment
+                            </span>
+                          </div>
+
+                          <div
+                            className="tw"
+                            style={{
+                              maxHeight: '420px',
+                              overflowY: 'auto',
+                              overflowX: 'auto',
+                              border: '1px solid var(--bd)',
+                              borderRadius: '8px',
+                            }}
+                          >
+                            <table className="nrep-table">
+                              <thead style={{ position: 'sticky', top: 0, zIndex: 4, background: '#f8fafc', boxShadow: '0 1px 0 var(--bd)' }}>
+                                <tr>
+                                  <th>Tag No.</th>
+                                  <th>Description</th>
+                                  <th>Type</th>
+                                  <th>Unit</th>
+                                  <th>System</th>
+                                  <th>Status</th>
+                                  <th>Progress</th>
+                                  <th>Base Line UTG</th>
+                                  <th>PMI</th>
+                                  <th>Document/Drawing</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {pagedKpiEquip.map((r) => (
+                                  <tr key={r.id}>
+                                    <td>
+                                      <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
+                                        <b>{r.EquipmentTagNo}</b>
+                                      </a>
+                                    </td>
+                                    <td>{r.EquipmentDescription || '—'}</td>
+                                    <td>{r.EquipmentType || '—'}</td>
+                                    <td>{r.Unit}</td>
+                                    <td>{r.SystemNo}</td>
+                                    <td>{renderStatusChip(getEquipmentOverallStatus(r))}</td>
+                                    <td>{calculateProgress([r])}%</td>
+                                    <td>{renderStatusChip(r.BaseLineUTG)}</td>
+                                    <td>{renderStatusChip(r.PMI)}</td>
+                                    <td>{renderDocumentDrawing(r.DocumentDrawing, r)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          {renderPaginationBar(filteredKpiEquip.length)}
+                        </>
+                      );
+                    })()}
                   </div>
                 )}
               </div>
@@ -3094,82 +4682,309 @@ export default function Dashboard() {
             {/* When NO KPI filter is active: show the standard full home page overview */}
             {!kpiFilter && (
               <>
-                {/* Unit-wise Matrix Table */}
-                <div className="cd">
-                  <h3>Unit-wise status and pending (level 1 of hierarchy)</h3>
-                  <input
-                    className="tsf"
-                    placeholder="🔍 Search in this table…"
-                    value={tableSearch}
-                    onChange={(e) => setTableSearch(e.target.value)}
-                  />
-                  <div className="tw">
-                    <table className="nrep-table">
-                      <thead>
-                        <tr>
-                          <th>Unit</th>
-                          <th>Equip.</th>
-                          <th>Completed</th>
-                          <th>In prog.</th>
-                          <th>Not started</th>
-                          <th style={{ minWidth: '175px' }}>Stage Progress</th>
-                          {STATUS_COLUMNS.map((col) => (
-                            <th key={col.key} className="ct" title={`Pending equipment count (${col.pendingValue})`}>
-                              {col.short}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {treeData
-                          .filter((u) => !tableSearch || u.name.toLowerCase().includes(tableSearch.toLowerCase()))
-                          .map((u) => {
-                            const c = u.items.filter((r) => getEquipmentOverallStatus(r) === 'Completed').length;
-                            const p = u.items.filter((r) => getEquipmentOverallStatus(r) === 'In progress').length;
-                            const n = u.items.length - c - p;
-                            return (
-                              <tr key={u.id}>
-                                <td>
-                                  <a href={`#${u.id}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                                    <b>{u.name}</b>
-                                    {u.name === 'UTILITY' && (
-                                      <span
-                                        style={{
-                                          fontSize: '9.5px',
-                                          fontWeight: 700,
-                                          padding: '1px 5px',
-                                          borderRadius: '4px',
-                                          background: '#e0f2fe',
-                                          color: '#0369a1',
-                                          border: '1px solid #bae6fd',
-                                        }}
+                {/* Level 1 Dual Containers: Unit-wise Status & Completed Work Progress + Unit-wise Remarks & Comments */}
+                <div className="unit-overview-dual-row">
+                  {/* Container 1: Unit-wise Status & Stage Completed Progress (Compacted) */}
+                  <div className="cd" style={{ margin: 0, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
+                      <div>
+                        <h3 style={{ margin: 0 }}>Unit-wise status and stage completed (level 1 of hierarchy)</h3>
+                        <span style={{ fontSize: '11px', color: 'var(--mu)' }}>
+                          Stage columns show completed work / issued count
+                        </span>
+                      </div>
+                      <input
+                        className="tsf"
+                        style={{ maxWidth: '200px', margin: 0, padding: '4px 8px', fontSize: '12px' }}
+                        placeholder="🔍 Search unit…"
+                        value={tableSearch}
+                        onChange={(e) => setTableSearch(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="tw" style={{ flex: 1, maxHeight: '380px', overflowY: 'auto' }}>
+                      <table className="nrep-table">
+                        <thead style={{ position: 'sticky', top: 0, zIndex: 4, background: 'var(--tr)' }}>
+                          <tr>
+                            <th>Unit</th>
+                            <th>Equip.</th>
+                            <th>Completed</th>
+                            <th>In prog.</th>
+                            <th>Not started</th>
+                            <th style={{ minWidth: '155px' }}>Stage Progress</th>
+                            {STATUS_COLUMNS.map((col) => (
+                              <th
+                                key={col.key}
+                                className="ct"
+                                title={`Work completed / issued count (${col.doneValue})`}
+                                style={{ minWidth: '82px', textAlign: 'center' }}
+                              >
+                                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px', width: '100%' }}>
+                                  <span style={{ textAlign: 'center' }}>{col.short}</span>
+                                  <span style={{ fontSize: '9px', textTransform: 'none', color: '#0369a1', fontWeight: 700, textAlign: 'center' }}>
+                                    ({col.doneValue})
+                                  </span>
+                                </div>
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {treeData
+                            .filter((u) => !tableSearch || u.name.toLowerCase().includes(tableSearch.toLowerCase()))
+                            .map((u) => {
+                              const c = u.items.filter((r) => getEquipmentOverallStatus(r) === 'Completed').length;
+                              const p = u.items.filter((r) => getEquipmentOverallStatus(r) === 'In progress').length;
+                              const n = u.items.length - c - p;
+                              return (
+                                <tr key={u.id}>
+                                  <td>
+                                    <a href={`#${u.id}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                                      <b>{u.name}</b>
+                                      {u.name === 'UTILITY' && (
+                                        <span
+                                          style={{
+                                            fontSize: '9.5px',
+                                            fontWeight: 700,
+                                            padding: '1px 5px',
+                                            borderRadius: '4px',
+                                            background: '#e0f2fe',
+                                            color: '#0369a1',
+                                            border: '1px solid #bae6fd',
+                                          }}
+                                        >
+                                          8 Sub-Units
+                                        </span>
+                                      )}
+                                      {u.name === 'MSP' && (
+                                        <span
+                                          style={{
+                                            fontSize: '9.5px',
+                                            fontWeight: 700,
+                                            padding: '1px 5px',
+                                            borderRadius: '4px',
+                                            background: '#f0fdf4',
+                                            color: '#166534',
+                                            border: '1px solid #bbf7d0',
+                                          }}
+                                        >
+                                          3 Sub-Units
+                                        </span>
+                                      )}
+                                    </a>
+                                  </td>
+                                  <td><b>{u.items.length}</b></td>
+                                  <td><span style={{ color: '#166534', fontWeight: 600 }}>{c}</span></td>
+                                  <td><span style={{ color: '#0369a1', fontWeight: 600 }}>{p}</span></td>
+                                  <td><span style={{ color: '#64748b' }}>{n}</span></td>
+                                  <td>{renderMiniProgressBar(u.items)}</td>
+                                  {STATUS_COLUMNS.map((col) => {
+                                    const done = getDoneStageCount(u.items, col.key);
+                                    const total = u.items.length;
+                                    const isAllDone = total > 0 && done === total;
+                                    const isPartDone = done > 0 && !isAllDone;
+                                    return (
+                                      <td
+                                        key={col.key}
+                                        className="ct"
+                                        style={{ textAlign: 'center' }}
+                                        title={`${u.name} — ${col.short}: ${done} of ${total} completed (${col.doneValue})`}
                                       >
-                                        8 Sub-Units
-                                      </span>
-                                    )}
-                                  </a>
-                                </td>
-                                <td>{u.items.length}</td>
-                                <td>{c}</td>
-                                <td>{p}</td>
-                                <td>{n}</td>
-                                <td>{renderMiniProgressBar(u.items)}</td>
-                                {STATUS_COLUMNS.map((col) => {
-                                  const pend = getPendingStageCount(u.items, col.key);
-                                  return (
-                                    <td key={col.key} className={pend ? 'pn' : 'pz'}>
-                                      {pend}
-                                    </td>
-                                  );
-                                })}
-                              </tr>
-                            );
-                          })}
-                      </tbody>
-                    </table>
+                                        <span
+                                          style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            minWidth: '24px',
+                                            height: '20px',
+                                            padding: '0 6px',
+                                            borderRadius: '4px',
+                                            fontSize: '11px',
+                                            fontWeight: 700,
+                                            background: isAllDone ? '#dcfce7' : isPartDone ? '#e0f2fe' : '#f1f5f9',
+                                            color: isAllDone ? '#166534' : isPartDone ? '#0284c7' : '#64748b',
+                                            border: isAllDone
+                                              ? '1px solid #bbf7d0'
+                                              : isPartDone
+                                              ? '1px solid #bae6fd'
+                                              : '1px solid #e2e8f0',
+                                          }}
+                                        >
+                                          {done}
+                                        </span>
+                                      </td>
+                                    );
+                                  })}
+                                </tr>
+                              );
+                            })}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="note" style={{ marginTop: '8px' }}>
+                      Stage columns show work completed/issued counts (Format-I/II/III/IV/V = Issued, Internal Insp. = Yes, Base Line UTG = Yes, PMI = Yes, Final Accept. = Accepted). Percentage is rolled up across hierarchy.
+                    </div>
                   </div>
-                  <div className="note">
-                    Percentage is calculated from the 6 stage dropdowns (Format-I/II/III = Issued, Internal Insp. = Yes, Base Line UTG = Yes, Final Accept. = Accept) rolled up across the hierarchy. Stage columns show pending equipment count.
+
+                  {/* Container 2: Unit-wise Remarks & Comments Summary (Compact Width) */}
+                  <div
+                    className="cd unit-remarks-container"
+                    style={{
+                      margin: 0,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      padding: '11px 10px',
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '8px', gap: '4px' }}>
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                          <MessageSquare size={13} color="#0284c7" />
+                          <h3 style={{ margin: 0, fontSize: '12px', whiteSpace: 'nowrap' }}>Remarks &amp; Notes</h3>
+                        </div>
+                        <span style={{ fontSize: '10.5px', color: 'var(--mu)' }}>
+                          Click unit to view comments
+                        </span>
+                      </div>
+                      <span
+                        style={{
+                          fontSize: '10px',
+                          fontWeight: 700,
+                          padding: '2px 6px',
+                          borderRadius: '10px',
+                          background: '#fef3c7',
+                          color: '#b45309',
+                          border: '1px solid #fde68a',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {equipment.filter((r) => (r.Remarks || '').trim().length > 0).length} active
+                      </span>
+                    </div>
+
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '5px', maxHeight: '380px', overflowY: 'auto', paddingRight: '2px' }}>
+                      {treeData.map((u) => {
+                        const unitComments = u.items.filter((r) => (r.Remarks || '').trim().length > 0);
+                        const count = unitComments.length;
+                        return (
+                          <div
+                            key={u.id}
+                            className="unit-remarks-card"
+                            onClick={() => {
+                              setRemarksFilterSearch('');
+                              setRemarksModalUnit(u.name);
+                            }}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              padding: '7px 9px',
+                              borderRadius: '5px',
+                              border: count > 0 ? '1px solid #cbd5e1' : '1px solid #e2e8f0',
+                              background: count > 0 ? '#ffffff' : '#f8fafc',
+                              boxShadow: '0 1px 2px rgba(15, 23, 42, 0.02)',
+                            }}
+                            title={`Click to view ${count} equipment comments in ${u.name}`}
+                          >
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '1px', minWidth: 0 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <span style={{ fontWeight: 700, fontSize: '12px', color: '#0f172a' }}>{u.name}</span>
+                                {u.name === 'UTILITY' && (
+                                  <span
+                                    style={{
+                                      fontSize: '8.5px',
+                                      fontWeight: 700,
+                                      padding: '0px 4px',
+                                      borderRadius: '3px',
+                                      background: '#e0f2fe',
+                                      color: '#0369a1',
+                                      border: '1px solid #bae6fd',
+                                    }}
+                                  >
+                                    8 Sub
+                                  </span>
+                                )}
+                                {u.name === 'MSP' && (
+                                  <span
+                                    style={{
+                                      fontSize: '8.5px',
+                                      fontWeight: 700,
+                                      padding: '0px 4px',
+                                      borderRadius: '3px',
+                                      background: '#f0fdf4',
+                                      color: '#166534',
+                                      border: '1px solid #bbf7d0',
+                                    }}
+                                  >
+                                    3 Sub
+                                  </span>
+                                )}
+                              </div>
+                              <span style={{ fontSize: '10px', color: 'var(--mu)' }}>
+                                {u.items.length} equip.
+                              </span>
+                            </div>
+
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0 }}>
+                              <span
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '2px',
+                                  fontSize: '10px',
+                                  fontWeight: 700,
+                                  padding: '1px 6px',
+                                  borderRadius: '10px',
+                                  background: count > 0 ? '#fef3c7' : '#f1f5f9',
+                                  color: count > 0 ? '#92400e' : '#64748b',
+                                  border: count > 0 ? '1px solid #fde68a' : '1px solid #e2e8f0',
+                                }}
+                              >
+                                💬 {count}
+                              </span>
+                              <ChevronRight size={12} color="#64748b" />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div
+                      style={{
+                        marginTop: '6px',
+                        paddingTop: '6px',
+                        borderTop: '1px solid var(--bd)',
+                        display: 'flex',
+                        justifyContent: 'center',
+                        alignItems: 'center',
+                      }}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setRemarksFilterSearch('');
+                          setRemarksModalUnit('ALL');
+                        }}
+                        style={{
+                          width: '100%',
+                          justifyContent: 'center',
+                          fontSize: '11px',
+                          fontWeight: 600,
+                          padding: '4px 8px',
+                          background: '#e0f2fe',
+                          color: '#0369a1',
+                          border: '1px solid #bae6fd',
+                          borderRadius: '5px',
+                          cursor: 'pointer',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '4px',
+                        }}
+                      >
+                        <MessageSquare size={11} />
+                        View All ({equipment.filter((r) => (r.Remarks || '').trim().length > 0).length})
+                      </button>
+                    </div>
                   </div>
                 </div>
 
@@ -3198,9 +5013,9 @@ export default function Dashboard() {
             <div className="bc">
               <a href="#" onClick={goToHome}>NREP Project</a> › {activeUnit.name}
             </div>
-            <h2 className="t">Unit: {activeUnit.name}</h2>
 
             {(() => {
+              const unitUniqueSystems = getUniqueSystemsFromList(activeUnit.items);
               const compPct = stats.total ? Math.round((stats.completed / stats.total) * 100) : 0;
               const progPct = stats.total ? Math.round((stats.inProgress / stats.total) * 100) : 0;
               const notStartPct = stats.total ? Math.round((stats.notStarted / stats.total) * 100) : 0;
@@ -3209,8 +5024,8 @@ export default function Dashboard() {
                 <div className="kp">
                   {renderProfessionalKpiCard({
                     label: 'Systems',
-                    value: activeUnit.systems.length,
-                    subtext: `In ${activeUnit.name}`,
+                    value: unitUniqueSystems.length,
+                    subtext: `${unitUniqueSystems.length} unique in System col`,
                     badgeText: 'Unit Scope',
                     pctBar: 100,
                     theme: 'indigo',
@@ -3220,7 +5035,7 @@ export default function Dashboard() {
                       setKpiSearch('');
                       setKpiFilter(kpiFilter === 'systems' ? null : 'systems');
                     },
-                    title: 'Click to see systems in this unit',
+                    title: 'Click to see unique systems in this unit (System column)',
                   })}
 
                   {renderProfessionalKpiCard({
@@ -3312,7 +5127,7 @@ export default function Dashboard() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px', flexWrap: 'wrap', gap: '8px' }}>
                   <h3 style={{ margin: 0, fontSize: '13px', color: 'var(--tx)' }}>
                     {kpiFilter === 'systems'
-                      ? `Systems in ${activeUnit.name} (${activeUnit.systems.length})`
+                      ? `Systems in ${activeUnit.name} (${getUniqueSystemsFromList(activeUnit.items).length} unique systems)`
                       : kpiFilter === 'prog'
                       ? `Stage-Wise Status — ${activeUnit.name}`
                       : kpiFilter === 'Completed'
@@ -3323,82 +5138,128 @@ export default function Dashboard() {
                       ? `Equipment Not Started in ${activeUnit.name} (${stats.notStarted})`
                       : `All Equipment in ${activeUnit.name} (${stats.total})`}
                   </h3>
-                  <button
-                    className="x"
-                    onClick={() => {
-                      setKpiFilter(null);
-                      setKpiSearch('');
-                    }}
-                    title="Close filter and restore unit overview"
-                    style={{ fontWeight: 600, padding: '4px 10px', fontSize: '12px' }}
-                  >
-                    ✕ Close &amp; Show Unit Overview
-                  </button>
                 </div>
 
-                {kpiFilter === 'systems' && (
-                  <div>
-                    <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap' }}>
-                      <input
-                        className="tsf"
-                        style={{ maxWidth: '340px', margin: 0 }}
-                        placeholder="🔍 Search systems in this unit…"
-                        value={kpiSearch}
-                        onChange={(e) => setKpiSearch(e.target.value)}
-                      />
+                {kpiFilter === 'systems' && (() => {
+                  const unitUniqueSystems = getUniqueSystemsFromList(activeUnit.items);
+                  return (
+                    <div>
+                      <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap' }}>
+                        <input
+                          className="tsf"
+                          style={{ maxWidth: '340px', margin: 0 }}
+                          placeholder="🔍 Search systems in this unit…"
+                          value={kpiSearch}
+                          onChange={(e) => setKpiSearch(e.target.value)}
+                        />
+                      </div>
+                      <div className="tw">
+                        <table className="nrep-table">
+                          <thead>
+                            <tr>
+                              <th>System</th>
+                              <th>Equip.</th>
+                              <th>Completed</th>
+                              <th>In prog.</th>
+                              <th>Not started</th>
+                              <th style={{ minWidth: '150px' }}>Stage Progress</th>
+                              {STATUS_COLUMNS.map((col) => (
+                                <th
+                                  key={col.key}
+                                  className="ct"
+                                  title={`Work completed / issued count (${col.doneValue})`}
+                                  style={{ minWidth: '82px', textAlign: 'center' }}
+                                >
+                                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px', width: '100%' }}>
+                                    <span style={{ textAlign: 'center' }}>{col.short}</span>
+                                    <span style={{ fontSize: '9px', textTransform: 'none', color: '#0369a1', fontWeight: 700, textAlign: 'center' }}>
+                                      ({col.doneValue})
+                                    </span>
+                                  </div>
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {unitUniqueSystems
+                              .filter(
+                                (sys) =>
+                                  !kpiSearch ||
+                                  sys.systemName.toLowerCase().includes(kpiSearch.toLowerCase()) ||
+                                  (sys.subUnit && sys.subUnit.toLowerCase().includes(kpiSearch.toLowerCase()))
+                              )
+                              .map((sys) => {
+                                const c = sys.items.filter((r) => getEquipmentOverallStatus(r) === 'Completed').length;
+                                const p = sys.items.filter((r) => getEquipmentOverallStatus(r) === 'In progress').length;
+                                const n = sys.items.length - c - p;
+                                return (
+                                  <tr key={sys.key}>
+                                    <td>
+                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                        <span style={{ fontWeight: 700, color: 'var(--tx)' }}>
+                                          {sys.systemName}
+                                        </span>
+                                        {sys.subUnit && (
+                                          <span style={{ fontSize: '10px', color: '#0369a1', fontWeight: 600 }}>
+                                            Sub-Unit: {sys.subUnit}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </td>
+                                    <td><b>{sys.items.length}</b></td>
+                                    <td><span style={{ color: '#166534', fontWeight: 600 }}>{c}</span></td>
+                                    <td><span style={{ color: '#0369a1', fontWeight: 600 }}>{p}</span></td>
+                                    <td><span style={{ color: '#64748b' }}>{n}</span></td>
+                                    <td>{renderMiniProgressBar(sys.items)}</td>
+                                    {STATUS_COLUMNS.map((col) => {
+                                      const done = getDoneStageCount(sys.items, col.key);
+                                      const total = sys.items.length;
+                                      const isAllDone = total > 0 && done === total;
+                                      const isPartDone = done > 0 && !isAllDone;
+                                      return (
+                                        <td
+                                          key={col.key}
+                                          className="ct"
+                                          style={{ textAlign: 'center' }}
+                                          title={`${sys.systemName} — ${col.short}: ${done} of ${total} completed (${col.doneValue})`}
+                                        >
+                                          <span
+                                            style={{
+                                              display: 'inline-flex',
+                                              alignItems: 'center',
+                                              justifyContent: 'center',
+                                              minWidth: '24px',
+                                              height: '20px',
+                                              padding: '0 6px',
+                                              borderRadius: '4px',
+                                              fontSize: '11px',
+                                              fontWeight: 700,
+                                              background: isAllDone ? '#dcfce7' : isPartDone ? '#e0f2fe' : '#f1f5f9',
+                                              color: isAllDone ? '#166534' : isPartDone ? '#0284c7' : '#64748b',
+                                              border: isAllDone
+                                                ? '1px solid #bbf7d0'
+                                                : isPartDone
+                                                ? '1px solid #bae6fd'
+                                                : '1px solid #e2e8f0',
+                                            }}
+                                          >
+                                            {done}
+                                          </span>
+                                        </td>
+                                      );
+                                    })}
+                                  </tr>
+                                );
+                              })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div className="note" style={{ marginTop: '8px' }}>
+                        Stage columns show work completed/issued counts (Format-I/II/III = Issued, Internal Insp. = Yes, Base Line UTG = Yes, Final Accept. = Accepted).
+                      </div>
                     </div>
-                    <div className="tw">
-                      <table className="nrep-table">
-                        <thead>
-                          <tr>
-                            <th>System</th>
-                            <th>Equip.</th>
-                            <th>Completed</th>
-                            <th>In prog.</th>
-                            <th>Not started</th>
-                            <th style={{ minWidth: '150px' }}>Status</th>
-                            {STATUS_COLUMNS.map((col) => (
-                              <th key={col.key} className="ct">
-                                {col.short}
-                              </th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {activeUnit.systems
-                            .filter((sys) => !kpiSearch || sys.name.toLowerCase().includes(kpiSearch.toLowerCase()))
-                            .map((sys) => {
-                              const c = sys.items.filter((r) => getEquipmentOverallStatus(r) === 'Completed').length;
-                              const p = sys.items.filter((r) => getEquipmentOverallStatus(r) === 'In progress').length;
-                              const n = sys.items.length - c - p;
-                              return (
-                                <tr key={sys.id}>
-                                  <td>
-                                    <a href={`#${sys.id}`}>
-                                      <b>{sys.name}</b>
-                                    </a>
-                                  </td>
-                                  <td>{sys.items.length}</td>
-                                  <td>{c}</td>
-                                  <td>{p}</td>
-                                  <td>{n}</td>
-                                  <td>{renderMiniProgressBar(sys.items)}</td>
-                                  {STATUS_COLUMNS.map((col) => {
-                                    const pend = getPendingStageCount(sys.items, col.key);
-                                    return (
-                                      <td key={col.key} className={pend ? 'pn' : 'pz'}>
-                                        {pend}
-                                      </td>
-                                    );
-                                  })}
-                                </tr>
-                              );
-                            })}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                )}
+                  );
+                })()}
 
                 {kpiFilter === 'prog' && (
                   <div>{renderStageWiseBars(activeUnit.items)}</div>
@@ -3406,186 +5267,226 @@ export default function Dashboard() {
 
                 {['all', 'Completed', 'In progress', 'Not started'].includes(kpiFilter) && (
                   <div>
-                    <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap' }}>
-                      <input
-                        className="tsf"
-                        style={{ maxWidth: '340px', margin: 0 }}
-                        placeholder="🔍 Search tag, description, system…"
-                        value={kpiSearch}
-                        onChange={(e) => setKpiSearch(e.target.value)}
-                      />
-                      <span style={{ fontSize: '12px', color: 'var(--mu)' }}>
-                        Showing {
-                          activeUnit.items.filter((r) => {
-                            const matchesFilter = kpiFilter === 'all' || getEquipmentOverallStatus(r) === kpiFilter;
-                            if (!matchesFilter) return false;
-                            if (!kpiSearch) return true;
-                            const q = kpiSearch.toLowerCase();
-                            return (
-                              r.EquipmentTagNo?.toLowerCase().includes(q) ||
-                              r.EquipmentDescription?.toLowerCase().includes(q) ||
-                              r.SystemNo?.toLowerCase().includes(q)
-                            );
-                          }).length
-                        } equipment
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setKpiFilter(null);
-                          setKpiSearch('');
-                        }}
-                        style={{
-                          marginLeft: 'auto',
-                          fontSize: '12px',
-                          padding: '4px 10px',
-                          background: 'var(--tr)',
-                          borderColor: 'var(--bd)',
-                        }}
-                      >
-                        ✕ Close &amp; Show Unit Overview
-                      </button>
-                    </div>
+                    {(() => {
+                      const statusScopedUnitKpiItems = activeUnit.items.filter(
+                        (r) => kpiFilter === 'all' || getEquipmentOverallStatus(r) === kpiFilter
+                      );
+                      const availableTypes = getAvailableEquipmentTypes(statusScopedUnitKpiItems);
+                      const filteredUnitKpiEquip = statusScopedUnitKpiItems.filter((r) => {
+                        if (kpiTypeFilter && (r.EquipmentType || '').trim() !== kpiTypeFilter) return false;
+                        if (!kpiSearch) return true;
+                        const q = kpiSearch.toLowerCase();
+                        return (
+                          r.EquipmentTagNo?.toLowerCase().includes(q) ||
+                          r.EquipmentDescription?.toLowerCase().includes(q) ||
+                          r.EquipmentType?.toLowerCase().includes(q) ||
+                          r.SystemNo?.toLowerCase().includes(q) ||
+                          r.BaseLineUTG?.toLowerCase().includes(q) ||
+                          r.PMI?.toLowerCase().includes(q) ||
+                          r.DocumentDrawing?.toLowerCase().includes(q)
+                        );
+                      });
+                      const effectiveSize = equipPageSize > 0 ? equipPageSize : filteredUnitKpiEquip.length || 1;
+                      const safePage = Math.min(equipPage, Math.max(1, Math.ceil(filteredUnitKpiEquip.length / effectiveSize)));
+                      const pagedUnitKpiEquip =
+                        equipPageSize > 0
+                          ? filteredUnitKpiEquip.slice((safePage - 1) * effectiveSize, safePage * effectiveSize)
+                          : filteredUnitKpiEquip;
 
-                    <div className="tw">
-                      <table className="nrep-table">
-                        <thead>
-                          <tr>
-                            <th>Tag No.</th>
-                            <th>Description</th>
-                            <th>System</th>
-                            <th>Status</th>
-                            <th>Progress</th>
-                            <th>Base Line UTG</th>
-                            <th>Document/Drawing</th>
-                            {isEditor && <th style={{ textAlign: 'center' }}>Action</th>}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {activeUnit.items
-                            .filter((r) => {
-                              const matchesFilter = kpiFilter === 'all' || getEquipmentOverallStatus(r) === kpiFilter;
-                              if (!matchesFilter) return false;
-                              if (!kpiSearch) return true;
-                              const q = kpiSearch.toLowerCase();
-                              return (
-                                r.EquipmentTagNo?.toLowerCase().includes(q) ||
-                                r.EquipmentDescription?.toLowerCase().includes(q) ||
-                                r.SystemNo?.toLowerCase().includes(q) ||
-                                r.BaseLineUTG?.toLowerCase().includes(q) ||
-                                r.DocumentDrawing?.toLowerCase().includes(q)
-                              );
-                            })
-                            .map((r) => (
-                              <tr key={r.id}>
-                                <td>
-                                  <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
-                                    <b>{r.EquipmentTagNo}</b>
-                                  </a>
-                                </td>
-                                <td>{r.EquipmentDescription || '—'}</td>
-                                <td>{r.SystemNo}</td>
-                                <td>{renderStatusChip(getEquipmentOverallStatus(r))}</td>
-                                <td>{calculateProgress([r])}%</td>
-                                <td>{renderStatusChip(r.BaseLineUTG)}</td>
-                                <td>{renderDocumentDrawing(r.DocumentDrawing)}</td>
-                                {isEditor && (
-                                  <td style={{ textAlign: 'center' }}>
-                                    <button
-                                      type="button"
-                                      onClick={() => setEditingEquipment(r)}
-                                      style={{
-                                        display: 'inline-flex',
-                                        alignItems: 'center',
-                                        gap: '3px',
-                                        padding: '3px 8px',
-                                        fontSize: '11px',
-                                        fontWeight: 600,
-                                        background: 'var(--tr)',
-                                        color: 'var(--ac)',
-                                        border: '1px solid var(--bd)',
-                                        borderRadius: '4px',
-                                        cursor: 'pointer',
-                                      }}
-                                      title={`Edit ${r.EquipmentTagNo}`}
-                                    >
-                                      <span>✏️</span> Edit
-                                    </button>
-                                  </td>
-                                )}
-                              </tr>
-                            ))}
-                        </tbody>
-                      </table>
-                    </div>
+                      return (
+                        <>
+                          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap' }}>
+                            <input
+                              className="tsf"
+                              style={{ maxWidth: '340px', margin: 0 }}
+                              placeholder="🔍 Search tag, description, type, system…"
+                              value={kpiSearch}
+                              onChange={(e) => setKpiSearch(e.target.value)}
+                            />
+                            <select
+                              value={kpiTypeFilter}
+                              onChange={(e) => setKpiTypeFilter(e.target.value)}
+                              style={{
+                                padding: '6px 10px',
+                                fontSize: '12px',
+                                borderRadius: '6px',
+                                border: '1px solid var(--bd)',
+                                background: '#ffffff',
+                                color: 'var(--tx)',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                              }}
+                              title="Filter by Equipment Type"
+                            >
+                              <option value="">All Types ({availableTypes.length})</option>
+                              {availableTypes.map(({ type, count }) => (
+                                <option key={type} value={type}>
+                                  {type} ({count})
+                                </option>
+                              ))}
+                            </select>
+                            <span style={{ fontSize: '12px', color: 'var(--mu)' }}>
+                              Showing {filteredUnitKpiEquip.length} equipment
+                            </span>
+                          </div>
+
+                          <div
+                            className="tw"
+                            style={{
+                              maxHeight: '420px',
+                              overflowY: 'auto',
+                              overflowX: 'auto',
+                              border: '1px solid var(--bd)',
+                              borderRadius: '8px',
+                            }}
+                          >
+                            <table className="nrep-table">
+                              <thead style={{ position: 'sticky', top: 0, zIndex: 4, background: '#f8fafc', boxShadow: '0 1px 0 var(--bd)' }}>
+                                <tr>
+                                  <th>Tag No.</th>
+                                  <th>Description</th>
+                                  <th>Type</th>
+                                  <th>System</th>
+                                  <th>Status</th>
+                                  <th>Progress</th>
+                                  <th>Base Line UTG</th>
+                                  <th>PMI</th>
+                                  <th>Document/Drawing</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {pagedUnitKpiEquip.map((r) => (
+                                  <tr key={r.id}>
+                                    <td>
+                                      <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
+                                        <b>{r.EquipmentTagNo}</b>
+                                      </a>
+                                    </td>
+                                    <td>{r.EquipmentDescription || '—'}</td>
+                                    <td>{r.EquipmentType || '—'}</td>
+                                    <td>{r.SystemNo}</td>
+                                    <td>{renderStatusChip(getEquipmentOverallStatus(r))}</td>
+                                    <td>{calculateProgress([r])}%</td>
+                                    <td>{renderStatusChip(r.BaseLineUTG)}</td>
+                                    <td>{renderStatusChip(r.PMI)}</td>
+                                    <td>{renderDocumentDrawing(r.DocumentDrawing, r)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          {renderPaginationBar(filteredUnitKpiEquip.length)}
+                        </>
+                      );
+                    })()}
                   </div>
                 )}
               </div>
             )}
 
-            {/* When NO KPI filter is active in Unit view: show unit overview + Sub-Units (for UTILITY) + Equipment list */}
+            {/* When NO KPI filter is active in Unit view: show Sub-Units (for UTILITY/MSP) + Equipment list + unit overview charts below */}
             {!kpiFilter && (
               <>
-                <div className="g2">
-                  <div className="cd overall-status-cd">
-                    <h3>Equipment status</h3>
-                    <div className="overall-status-body">
-                      {renderDonutChart(stats)}
-                    </div>
-                  </div>
-                  <div className="cd">
-                    <h3>Stage-wise status — {activeUnit.name}</h3>
-                    {renderStageWiseBars(activeUnit.items)}
-                  </div>
-                </div>
-
-                {/* For UTILITY: Display the 8 Sub-Units Matrix Table (DM-CPU, N2U, CA-IA, BOILERS AND HRSG, COOLING TOWER, RWDU, RW FILTER, RW RESERVOIR) */}
-                {activeUnit.name === 'UTILITY' && (
+                {/* If Unit has Sub-Units, Systems, or Sub-Systems: Display the Hierarchy Nodes Matrix Table */}
+                {activeUnit.children.length > 0 && (
                   <div className="cd">
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px', marginBottom: '8px' }}>
                       <h3 style={{ margin: 0 }}>
-                        Sub-Units in UTILITY (8 Sub-Units — Click a Sub-Unit to open its Equipment)
+                        Sub-Units / Systems / Sub-Systems in {activeUnit.name} (Click any level to open its Equipment)
                       </h3>
                     </div>
                     <div className="tw">
                       <table className="nrep-table">
                         <thead>
                           <tr>
-                            <th>Sub-Unit (UTILITY)</th>
+                            <th>Hierarchy Path ({activeUnit.name})</th>
+                            <th>Level</th>
                             <th>Equip.</th>
                             <th>Completed</th>
                             <th>In prog.</th>
                             <th>Not started</th>
-                            <th style={{ minWidth: '150px' }}>Status</th>
+                            <th style={{ minWidth: '150px' }}>Stage Progress</th>
                             {STATUS_COLUMNS.map((col) => (
-                              <th key={col.key} className="ct">
-                                {col.short}
+                              <th
+                                key={col.key}
+                                className="ct"
+                                title={`Work completed / issued count (${col.doneValue})`}
+                                style={{ minWidth: '82px', textAlign: 'center' }}
+                              >
+                                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px', width: '100%' }}>
+                                  <span style={{ textAlign: 'center' }}>{col.short}</span>
+                                  <span style={{ fontSize: '9px', textTransform: 'none', color: '#0369a1', fontWeight: 700, textAlign: 'center' }}>
+                                    ({col.doneValue})
+                                  </span>
+                                </div>
                               </th>
                             ))}
                           </tr>
                         </thead>
                         <tbody>
-                          {activeUnit.systems.map((sys) => {
+                          {activeUnit.tableSystems.map((sys) => {
                             const c = sys.items.filter((r) => getEquipmentOverallStatus(r) === 'Completed').length;
                             const p = sys.items.filter((r) => getEquipmentOverallStatus(r) === 'In progress').length;
                             const n = sys.items.length - c - p;
                             return (
                               <tr key={sys.id}>
                                 <td>
-                                  <a href={`#${sys.id}`}>
-                                    <b>{sys.name}</b>
-                                  </a>
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                    <a href={`#${sys.id}`}>
+                                      <b>{sys.name}</b>
+                                    </a>
+                                    {sys.children.length > 0 && (
+                                      <span style={{ fontSize: '10px', color: '#0369a1', fontWeight: 600 }}>
+                                        ↳ {sys.children.length} {sys.children[0]?.levelBadge || 'Sub-System'}
+                                        {sys.children.length > 1 ? 's' : ''}: {sys.children.map((ch) => ch.name).join(', ')}
+                                      </span>
+                                    )}
+                                  </div>
                                 </td>
-                                <td>{sys.items.length}</td>
-                                <td>{c}</td>
-                                <td>{p}</td>
-                                <td>{n}</td>
+                                <td>
+                                  <span className="c a" style={{ fontSize: '10px', fontWeight: 700 }}>
+                                    {sys.levelBadge}
+                                  </span>
+                                </td>
+                                <td><b>{sys.items.length}</b></td>
+                                <td><span style={{ color: '#166534', fontWeight: 600 }}>{c}</span></td>
+                                <td><span style={{ color: '#0369a1', fontWeight: 600 }}>{p}</span></td>
+                                <td><span style={{ color: '#64748b' }}>{n}</span></td>
                                 <td>{renderMiniProgressBar(sys.items)}</td>
                                 {STATUS_COLUMNS.map((col) => {
-                                  const pend = getPendingStageCount(sys.items, col.key);
+                                  const done = getDoneStageCount(sys.items, col.key);
+                                  const total = sys.items.length;
+                                  const isAllDone = total > 0 && done === total;
+                                  const isPartDone = done > 0 && !isAllDone;
                                   return (
-                                    <td key={col.key} className={pend ? 'pn' : 'pz'}>
-                                      {pend}
+                                    <td
+                                      key={col.key}
+                                      className="ct"
+                                      style={{ textAlign: 'center' }}
+                                      title={`${sys.pathLabel} — ${col.short}: ${done} of ${total} completed (${col.doneValue})`}
+                                    >
+                                      <span
+                                        style={{
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          justifyContent: 'center',
+                                          minWidth: '24px',
+                                          height: '20px',
+                                          padding: '0 6px',
+                                          borderRadius: '4px',
+                                          fontSize: '11px',
+                                          fontWeight: 700,
+                                          background: isAllDone ? '#dcfce7' : isPartDone ? '#e0f2fe' : '#f1f5f9',
+                                          color: isAllDone ? '#166534' : isPartDone ? '#0284c7' : '#64748b',
+                                          border: isAllDone
+                                            ? '1px solid #bbf7d0'
+                                            : isPartDone
+                                            ? '1px solid #bae6fd'
+                                            : '1px solid #e2e8f0',
+                                        }}
+                                      >
+                                        {done}
+                                      </span>
                                     </td>
                                   );
                                 })}
@@ -3598,13 +5499,11 @@ export default function Dashboard() {
                   </div>
                 )}
 
-                {/* Direct Equipment Table inside the Unit (for RPTU, MSP, PFCCU, CDU/VDU, DHDT, SRB and also UTILITY) */}
+                {/* Direct Equipment Table inside the Unit */}
                 <div className="cd">
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', marginBottom: '10px' }}>
                     <h3 style={{ margin: 0 }}>
-                      {activeUnit.name === 'UTILITY'
-                        ? 'All Equipment in UTILITY (Across 8 Sub-Units)'
-                        : `Equipment List in ${activeUnit.name} (${activeUnit.items.length} Equipment)`}
+                      {`Equipment List in ${activeUnit.name} (${activeUnit.items.length} Equipment)`}
                     </h3>
                     {isEditor && (
                       <button
@@ -3613,17 +5512,21 @@ export default function Dashboard() {
                           setEditingEquipment({
                             id: '',
                             Unit: activeUnit.name,
-                            SubUnit: activeUnit.name === 'UTILITY' ? UTILITY_SUB_UNITS[0] : '',
-                            SystemNo: activeUnit.name === 'UTILITY' ? UTILITY_SUB_UNITS[0] : `${activeUnit.name} Main System`,
+                            SubUnit: '',
+                            SystemNo: '',
+                            SubSystem: '',
                             EquipmentTagNo: '',
                             EquipmentDescription: '',
                             EquipmentType: '',
                             FormatIStatus: 'Not Issued',
                             FormatIIStatus: 'Not Issued',
                             FormatIIIStatus: 'Not Issued',
+                            FormatIVStatus: 'Not Issued',
+                            FormatVStatus: 'Not Issued',
                             InternalInspectionStatus: 'No',
                             BaseLineUTG: 'No',
-                            FinalSystemAcceptance: 'Not accept',
+                            PMI: 'No',
+                            FinalSystemAcceptance: 'Not Accepted',
                             DocumentDrawing: '',
                             Remarks: '',
                           })
@@ -3644,163 +5547,187 @@ export default function Dashboard() {
                     )}
                   </div>
 
-                  <div className="tools">
-                    <input
-                      placeholder="🔍 Search tag, description, sub-unit, Base Line UTG, Document/Drawing, remarks…"
-                      value={systemSearch}
-                      onChange={(e) => setSystemSearch(e.target.value)}
-                    />
-                    <select
-                      value={systemStatusFilter}
-                      onChange={(e) => setSystemStatusFilter(e.target.value)}
-                    >
-                      <option value="">All Statuses</option>
-                      <option value="Completed">Completed</option>
-                      <option value="In progress">In progress</option>
-                      <option value="Not started">Not started</option>
-                    </select>
-                  </div>
+                  {(() => {
+                    const availableUnitTypes = getAvailableEquipmentTypes(activeUnit.items);
+                    return (
+                      <div className="tools">
+                        <input
+                          placeholder="🔍 Search tag, description, type, sub-unit, system, sub-system, Base Line UTG, PMI, remarks…"
+                          value={systemSearch}
+                          onChange={(e) => setSystemSearch(e.target.value)}
+                        />
+                        <select
+                          value={systemTypeFilter}
+                          onChange={(e) => setSystemTypeFilter(e.target.value)}
+                          title="Filter by Equipment Type (e.g. Vessel, Exchanger)"
+                        >
+                          <option value="">All Types ({availableUnitTypes.length})</option>
+                          {availableUnitTypes.map(({ type, count }) => (
+                            <option key={type} value={type}>
+                              {type} ({count})
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          value={systemStatusFilter}
+                          onChange={(e) => setSystemStatusFilter(e.target.value)}
+                        >
+                          <option value="">All Statuses</option>
+                          <option value="Completed">Completed</option>
+                          <option value="In progress">In progress</option>
+                          <option value="Not started">Not started</option>
+                        </select>
+                      </div>
+                    );
+                  })()}
 
                   {activeUnit.items.length === 0 ? (
                     <div className="empty">No equipment in {activeUnit.name} yet. Click &quot;+ Add Equipment&quot; above to add records.</div>
                   ) : (
-                    <div className="tw">
-                      <table className="nrep-table">
-                        <thead>
-                          <tr>
-                            <th>Tag No.</th>
-                            {activeUnit.name === 'UTILITY' && <th>Sub-Unit</th>}
-                            <th>Description</th>
-                            <th>Type</th>
-                            <th>Status</th>
-                            <th>Progress</th>
-                            {STATUS_COLUMNS.map((col) => (
-                              <th key={col.key}>{col.short}</th>
-                            ))}
-                            <th>Document/Drawing</th>
-                            {isEditor && <th style={{ textAlign: 'center' }}>Action</th>}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {activeUnit.items
-                            .filter((r) => {
-                              const q = systemSearch.toLowerCase();
-                              const matchesSearch =
-                                !q || Object.values(r).join(' ').toLowerCase().includes(q);
-                              const matchesFilter =
-                                !systemStatusFilter || getEquipmentOverallStatus(r) === systemStatusFilter;
-                              return matchesSearch && matchesFilter;
-                            })
-                            .map((r) => {
-                              const overall = getEquipmentOverallStatus(r);
-                              const eqPct = calculateProgress([r]);
-                              return (
-                                <tr key={r.id}>
-                                  <td>
-                                    <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
-                                      <b>{r.EquipmentTagNo}</b>
-                                    </a>
-                                  </td>
-                                  {activeUnit.name === 'UTILITY' && (
-                                    <td>
-                                      <span className="c a" style={{ fontWeight: 700 }}>
-                                        {r.SubUnit || r.SystemNo}
-                                      </span>
-                                    </td>
-                                  )}
-                                  <td>{r.EquipmentDescription || '—'}</td>
-                                  <td>{r.EquipmentType || '—'}</td>
-                                  <td>{renderStatusChip(overall === 'Not started' ? '' : overall)}</td>
-                                  <td>
-                                    <span className={`pl ${eqPct === 100 ? 'g' : eqPct > 0 ? 'a' : ''}`}>
-                                      {eqPct}%
-                                    </span>
-                                  </td>
-                                  {STATUS_COLUMNS.map((col) => {
-                                    const val = (r[col.key] as string) || col.pendingValue;
-                                    return (
-                                      <td key={col.key}>
-                                        {isEditor ? (
-                                          <select
-                                            value={val}
-                                            style={{
-                                              fontSize: '11px',
-                                              padding: '3px 6px',
-                                              borderRadius: '4px',
-                                              border: '1px solid #cbd5e1',
-                                              background: isDone(val) ? '#f0fdf4' : '#fffbeb',
-                                              color: isDone(val) ? '#15803d' : '#b45309',
-                                              fontWeight: 600,
-                                              cursor: 'pointer',
-                                            }}
-                                            title={`Change ${col.label}`}
-                                            onChange={async (e) => {
-                                              try {
-                                                await updateEquipmentField(r.id, col.key, e.target.value);
-                                              } catch (err: any) {
-                                                console.error(err.message);
-                                              }
-                                            }}
-                                          >
-                                            {col.options.map((opt) => (
-                                              <option key={opt} value={opt}>
-                                                {opt}
-                                              </option>
-                                            ))}
-                                          </select>
+                    (() => {
+                      const filteredUnitItems = activeUnit.items.filter((r) => {
+                        const q = systemSearch.toLowerCase();
+                        const matchesSearch =
+                          !q || Object.values(r).join(' ').toLowerCase().includes(q);
+                        const matchesFilter =
+                          !systemStatusFilter || getEquipmentOverallStatus(r) === systemStatusFilter;
+                        const matchesType =
+                          !systemTypeFilter || (r.EquipmentType || '').trim() === systemTypeFilter;
+                        return matchesSearch && matchesFilter && matchesType;
+                      });
+
+                      if (filteredUnitItems.length === 0) {
+                        return <div className="empty">No matching equipment found in {activeUnit.name}.</div>;
+                      }
+
+                      const effectiveSize = equipPageSize > 0 ? equipPageSize : filteredUnitItems.length || 1;
+                      const safePage = Math.min(equipPage, Math.max(1, Math.ceil(filteredUnitItems.length / effectiveSize)));
+                      const pagedUnitItems =
+                        equipPageSize > 0
+                          ? filteredUnitItems.slice((safePage - 1) * effectiveSize, safePage * effectiveSize)
+                          : filteredUnitItems;
+
+                      return (
+                        <>
+                          <div
+                            className="tw"
+                            style={{
+                              maxHeight: '420px',
+                              overflowY: 'auto',
+                              overflowX: 'auto',
+                              border: '1px solid var(--bd)',
+                              borderRadius: '8px',
+                            }}
+                          >
+                            <table className="nrep-table">
+                              <thead style={{ position: 'sticky', top: 0, zIndex: 4, background: '#f8fafc', boxShadow: '0 1px 0 var(--bd)' }}>
+                                <tr>
+                                  <th>Tag No.</th>
+                                  <th>Hierarchy (Sub-Unit › System › Sub-System)</th>
+                                  <th>Description</th>
+                                  <th>Type</th>
+                                  <th>Status</th>
+                                  <th>Progress</th>
+                                  {STATUS_COLUMNS.map((col) => (
+                                    <th key={col.key}>{col.short}</th>
+                                  ))}
+                                  <th>Document/Drawing</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {pagedUnitItems.map((r) => {
+                                  const overall = getEquipmentOverallStatus(r);
+                                  const eqPct = calculateProgress([r]);
+                                  const subChain = getEquipmentHierarchyChain(r).slice(1);
+                                  return (
+                                    <tr key={r.id}>
+                                      <td>
+                                        <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
+                                          <b>{r.EquipmentTagNo}</b>
+                                        </a>
+                                      </td>
+                                      <td>
+                                        {subChain.length > 0 ? (
+                                          <span className="c a" style={{ fontWeight: 700 }}>
+                                            {subChain.map((s) => s.value).join(' › ')}
+                                          </span>
                                         ) : (
-                                          renderStatusChip(val)
+                                          <span style={{ color: 'var(--mu)', fontSize: '11px' }}>
+                                            Direct in {r.Unit}
+                                          </span>
                                         )}
                                       </td>
-                                    );
-                                  })}
-                                  <td>{renderDocumentDrawing(r.DocumentDrawing)}</td>
-                                  {isEditor && (
-                                    <td style={{ textAlign: 'center', whiteSpace: 'nowrap' }}>
-                                      <button
-                                        type="button"
-                                        className="btn btn-sm"
-                                        style={{
-                                          padding: '3px 8px',
-                                          fontSize: '11px',
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '4px',
-                                          background: '#f0f7ff',
-                                          color: '#0284c7',
-                                          borderColor: '#bae6fd',
-                                          borderRadius: '4px',
-                                          cursor: 'pointer',
-                                        }}
-                                        title="Edit equipment record"
-                                        onClick={() => setEditingEquipment(r)}
-                                      >
-                                        Edit
-                                      </button>
-                                    </td>
-                                  )}
-                                </tr>
-                              );
-                            })}
-                        </tbody>
-                      </table>
-                    </div>
+                                      <td>{r.EquipmentDescription || '—'}</td>
+                                      <td>{r.EquipmentType || '—'}</td>
+                                      <td>{renderStatusChip(overall === 'Not started' ? '' : overall)}</td>
+                                      <td>
+                                        <span className={`pl ${eqPct === 100 ? 'g' : eqPct > 0 ? 'a' : ''}`}>
+                                          {eqPct}%
+                                        </span>
+                                      </td>
+                                      {STATUS_COLUMNS.map((col) => {
+                                        const val = (r[col.key] as string) || col.pendingValue;
+                                        return (
+                                          <td key={col.key}>
+                                            {renderStatusChip(val)}
+                                          </td>
+                                        );
+                                      })}
+                                      <td>{renderDocumentDrawing(r.DocumentDrawing, r)}</td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                          {renderPaginationBar(filteredUnitItems.length)}
+                        </>
+                      );
+                    })()
                   )}
+                </div>
+
+                <div className="g2">
+                  <div className="cd overall-status-cd">
+                    <h3>Equipment status</h3>
+                    <div className="overall-status-body">
+                      {renderDonutChart(stats)}
+                    </div>
+                  </div>
+                  <div className="cd">
+                    <h3>Stage-wise status — {activeUnit.name}</h3>
+                    {renderStageWiseBars(activeUnit.items)}
+                  </div>
                 </div>
               </>
             )}
           </>
         )}
 
-        {/* LEVEL 3: SUB-UNIT / SYSTEM VIEW WITH EQUIPMENT TABLE */}
+        {/* LEVEL 3: SUB-UNIT / SYSTEM / SUB-SYSTEM VIEW WITH EQUIPMENT TABLE */}
         {viewLevel === 's' && activeUnit && activeSystem && (
           <>
             <div className="bc">
-              <a href="#" onClick={goToHome}>NREP Project</a> › <a href={`#${activeUnit.id}`}>{activeUnit.name}</a> › {activeSystem.name}
+              <a href="#" onClick={goToHome}>NREP Project</a> › <a href={`#${activeUnit.id}`}>{activeUnit.name}</a>
+              {activeSystem.ancestorIds.map((ancId, idx) => {
+                const ancNode = activeUnit.systems.find((s) => s.id === ancId);
+                if (!ancNode) return null;
+                const isLast = idx === activeSystem.ancestorIds.length - 1;
+                return (
+                  <React.Fragment key={ancId}>
+                    {' › '}
+                    {isLast ? (
+                      <span>{ancNode.name}</span>
+                    ) : (
+                      <a href={`#${ancNode.id}`}>{ancNode.name}</a>
+                    )}
+                  </React.Fragment>
+                );
+              })}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', marginBottom: '10px' }}>
               <h2 className="t" style={{ margin: 0 }}>
-                {activeUnit.name === 'UTILITY' ? `Sub-Unit: ${activeSystem.name} (UTILITY)` : activeSystem.name}
+                {`${activeSystem.levelBadge}: ${activeSystem.name} (${activeUnit.name}${activeSystem.pathLabel !== activeSystem.name ? ` › ${activeSystem.pathLabel}` : ''})`}
               </h2>
               {isEditor && (
                 <button
@@ -3809,17 +5736,21 @@ export default function Dashboard() {
                     setEditingEquipment({
                       id: '',
                       Unit: activeUnit.name,
-                      SubUnit: activeUnit.name === 'UTILITY' ? activeSystem.name : '',
-                      SystemNo: activeSystem.name,
+                      SubUnit: activeSystem.subUnitName || '',
+                      SystemNo: activeSystem.systemName || '',
+                      SubSystem: activeSystem.subSystemName || '',
                       EquipmentTagNo: '',
                       EquipmentDescription: '',
                       EquipmentType: '',
                       FormatIStatus: 'Not Issued',
                       FormatIIStatus: 'Not Issued',
                       FormatIIIStatus: 'Not Issued',
+                      FormatIVStatus: 'Not Issued',
+                      FormatVStatus: 'Not Issued',
                       InternalInspectionStatus: 'No',
                       BaseLineUTG: 'No',
-                      FinalSystemAcceptance: 'Not accept',
+                      PMI: 'No',
+                      FinalSystemAcceptance: 'Not Accepted',
                       DocumentDrawing: '',
                       Remarks: '',
                     })
@@ -3844,33 +5775,55 @@ export default function Dashboard() {
               const compPct = stats.total ? Math.round((stats.completed / stats.total) * 100) : 0;
               const progPct = stats.total ? Math.round((stats.inProgress / stats.total) * 100) : 0;
               const notStartPct = stats.total ? Math.round((stats.notStarted / stats.total) * 100) : 0;
+              const childLevelPlural = activeSystem.children.length > 0
+                ? `${activeSystem.children[0]?.levelBadge || 'Sub-System'}s`
+                : 'Sub-Systems';
+              const toggleKpi = (filter: string) => {
+                setKpiSearch('');
+                setKpiTypeFilter('');
+                setKpiFilter(kpiFilter === filter ? null : filter);
+              };
 
               return (
                 <div className="kp">
+                  {activeSystem.children.length > 0 &&
+                    renderProfessionalKpiCard({
+                      label: childLevelPlural,
+                      value: activeSystem.children.length,
+                      subtext: `In ${activeSystem.name}`,
+                      badgeText: `${activeSystem.levelBadge} Scope`,
+                      pctBar: 100,
+                      theme: 'indigo',
+                      icon: <Layers size={13} />,
+                      active: kpiFilter === 'systems',
+                      onClick: () => toggleKpi('systems'),
+                      title: `Show ${childLevelPlural.toLowerCase()} in ${activeSystem.name}`,
+                    })}
+
                   {renderProfessionalKpiCard({
                     label: 'Equipment',
                     value: stats.total,
-                    subtext: 'System equipment tags',
+                    subtext: `${activeSystem.levelBadge} equipment tags`,
                     badgeText: '100%',
                     pctBar: 100,
                     theme: 'cyan',
                     icon: <Cpu size={13} />,
-                    active: systemStatusFilter === '',
-                    onClick: () => setSystemStatusFilter(''),
-                    title: 'Show all equipment in system',
+                    active: kpiFilter === 'all',
+                    onClick: () => toggleKpi('all'),
+                    title: `Show all equipment in ${activeSystem.name}`,
                   })}
 
                   {renderProfessionalKpiCard({
                     label: 'Completed',
                     value: stats.completed,
-                    subtext: `${compPct}% of system tags`,
+                    subtext: `${compPct}% of ${activeSystem.levelBadge.toLowerCase()} tags`,
                     badgeText: `${compPct}%`,
                     pctBar: compPct,
                     theme: 'green',
                     icon: <CheckCircle2 size={13} />,
-                    active: systemStatusFilter === 'Completed',
-                    onClick: () => setSystemStatusFilter(systemStatusFilter === 'Completed' ? '' : 'Completed'),
-                    title: 'Filter completed equipment',
+                    active: kpiFilter === 'Completed',
+                    onClick: () => toggleKpi('Completed'),
+                    title: 'Show completed equipment',
                   })}
 
                   {renderProfessionalKpiCard({
@@ -3881,9 +5834,9 @@ export default function Dashboard() {
                     pctBar: progPct,
                     theme: 'amber',
                     icon: <Clock size={13} />,
-                    active: systemStatusFilter === 'In progress',
-                    onClick: () => setSystemStatusFilter(systemStatusFilter === 'In progress' ? '' : 'In progress'),
-                    title: 'Filter in progress equipment',
+                    active: kpiFilter === 'In progress',
+                    onClick: () => toggleKpi('In progress'),
+                    title: 'Show in-progress equipment',
                   })}
 
                   {renderProfessionalKpiCard({
@@ -3894,709 +5847,1945 @@ export default function Dashboard() {
                     pctBar: notStartPct,
                     theme: 'slate',
                     icon: <CircleDashed size={13} />,
-                    active: systemStatusFilter === 'Not started',
-                    onClick: () => setSystemStatusFilter(systemStatusFilter === 'Not started' ? '' : 'Not started'),
-                    title: 'Filter not started equipment',
+                    active: kpiFilter === 'Not started',
+                    onClick: () => toggleKpi('Not started'),
+                    title: 'Show not-started equipment',
                   })}
 
                   {renderProfessionalKpiCard({
                     label: 'Stage Progress',
                     value: `${stats.progressPct}%`,
-                    subtext: '6-stage system progress',
+                    subtext: `6-stage ${activeSystem.levelBadge.toLowerCase()} progress`,
                     badgeText: 'Live',
                     pctBar: stats.progressPct,
                     theme: 'blue',
                     icon: <TrendingUp size={13} />,
-                    active: false,
-                    title: 'Overall stage progress in system',
+                    active: kpiFilter === 'prog',
+                    onClick: () => toggleKpi('prog'),
+                    title: `Show stage-wise breakdown in ${activeSystem.name}`,
                   })}
                 </div>
               );
             })()}
 
-            <div className="g2">
-              <div className="cd overall-status-cd">
-                <h3>Equipment status</h3>
-                <div className="overall-status-body">
-                  {renderDonutChart(stats)}
+            {/* Interactive KPI Drill-Down Card inside System / Sub-System View */}
+            {kpiFilter && (
+              <div id="kd" className="cd on">
+                <div className="kdh">
+                  <h3>
+                    {kpiFilter === 'systems' &&
+                      `${activeSystem.children[0]?.levelBadge || 'Sub-System'}s in ${activeSystem.name} (${activeSystem.children.length})`}
+                    {kpiFilter === 'prog' && `Stage-wise Progress in ${activeSystem.name} (${stats.progressPct}% overall)`}
+                    {kpiFilter === 'all' && `All Equipment in ${activeSystem.name} (${activeSystem.items.length})`}
+                    {['Completed', 'In progress', 'Not started'].includes(kpiFilter) &&
+                      `${kpiFilter} Equipment in ${activeSystem.name} (${
+                        activeSystem.items.filter((r) => getEquipmentOverallStatus(r) === kpiFilter).length
+                      })`}
+                  </h3>
                 </div>
-              </div>
-              <div className="cd">
-                <h3>Stage-wise status</h3>
-                {renderStageWiseBars(activeSystem.items)}
-              </div>
-            </div>
 
-            <div className="cd">
-              <h3>Equipment list (level 3) — click a tag for full detail</h3>
-              <div className="tools">
-                <input
-                  id="q"
-                  placeholder="Search tag, description, Base Line UTG, Document/Drawing, remarks…"
-                  value={systemSearch}
-                  onChange={(e) => setSystemSearch(e.target.value)}
-                />
-                <select
-                  id="sf"
-                  value={systemStatusFilter}
-                  onChange={(e) => setSystemStatusFilter(e.target.value)}
-                >
-                  <option value="">All</option>
-                  <option value="Completed">Completed</option>
-                  <option value="In progress">In progress</option>
-                  <option value="Not started">Not started</option>
-                </select>
-              </div>
-
-              <div id="eqt">
-                {activeSystem.items.length === 0 ? (
-                  <div className="empty">No matching equipment.</div>
-                ) : (
-                  <div className="tw">
-                    <table className="nrep-table">
-                      <thead>
-                        <tr>
-                          <th>Tag No.</th>
-                          <th>Description</th>
-                          <th>Type</th>
-                          <th>Status</th>
-                          <th>Progress</th>
-                          {STATUS_COLUMNS.map((col) => (
-                            <th key={col.key}>{col.short}</th>
-                          ))}
-                          <th>Document/Drawing</th>
-                          {isEditor && <th style={{ textAlign: 'center' }}>Action</th>}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {activeSystem.items
-                          .filter((r) => {
-                            const q = systemSearch.toLowerCase();
-                            const matchesSearch =
-                              !q || Object.values(r).join(' ').toLowerCase().includes(q);
-                            const matchesFilter =
-                              !systemStatusFilter || getEquipmentOverallStatus(r) === systemStatusFilter;
-                            return matchesSearch && matchesFilter;
-                          })
-                          .map((r) => {
-                            const overall = getEquipmentOverallStatus(r);
-                            const eqPct = calculateProgress([r]);
-                            return (
-                              <tr key={r.id}>
-                                <td>
-                                  <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
-                                    <b>{r.EquipmentTagNo}</b>
-                                  </a>
-                                </td>
-                                <td>{r.EquipmentDescription || '—'}</td>
-                                <td>{r.EquipmentType || '—'}</td>
-                                <td>{renderStatusChip(overall === 'Not started' ? '' : overall)}</td>
-                                <td>
-                                  <span className={`pl ${eqPct === 100 ? 'g' : eqPct > 0 ? 'a' : ''}`}>
-                                    {eqPct}%
+                {kpiFilter === 'systems' && (
+                  <div>
+                    <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap' }}>
+                      <input
+                        className="tsf"
+                        style={{ maxWidth: '340px', margin: 0 }}
+                        placeholder={`🔍 Search ${(activeSystem.children[0]?.levelBadge || 'sub-system').toLowerCase()}s in ${activeSystem.name}…`}
+                        value={kpiSearch}
+                        onChange={(e) => setKpiSearch(e.target.value)}
+                      />
+                    </div>
+                    <div className="tw">
+                      <table className="nrep-table">
+                        <thead>
+                          <tr>
+                            <th>{activeSystem.children[0]?.levelBadge || 'Sub-System'}</th>
+                            <th>Level</th>
+                            <th>Equip.</th>
+                            <th>Completed</th>
+                            <th>In prog.</th>
+                            <th>Not started</th>
+                            <th style={{ minWidth: '150px' }}>Stage Progress</th>
+                            {STATUS_COLUMNS.map((col) => (
+                              <th
+                                key={col.key}
+                                className="ct"
+                                title={`Work completed / issued count (${col.doneValue})`}
+                                style={{ minWidth: '82px', textAlign: 'center' }}
+                              >
+                                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px', width: '100%' }}>
+                                  <span style={{ textAlign: 'center' }}>{col.short}</span>
+                                  <span style={{ fontSize: '9px', textTransform: 'none', color: '#0369a1', fontWeight: 700, textAlign: 'center' }}>
+                                    ({col.doneValue})
                                   </span>
-                                </td>
-                                {STATUS_COLUMNS.map((col) => {
-                                  const val = (r[col.key] as string) || col.pendingValue;
-                                  return (
-                                    <td key={col.key}>
-                                      {isEditor ? (
-                                        <select
-                                          value={val}
+                                </div>
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {activeSystem.children
+                            .filter(
+                              (ch) =>
+                                !kpiSearch ||
+                                ch.name.toLowerCase().includes(kpiSearch.toLowerCase()) ||
+                                ch.pathLabel.toLowerCase().includes(kpiSearch.toLowerCase())
+                            )
+                            .map((ch) => {
+                              const c = ch.items.filter((r) => getEquipmentOverallStatus(r) === 'Completed').length;
+                              const p = ch.items.filter((r) => getEquipmentOverallStatus(r) === 'In progress').length;
+                              const n = ch.items.length - c - p;
+                              return (
+                                <tr key={ch.id}>
+                                  <td>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                      <a href={`#${ch.id}`}>
+                                        <b>{ch.name}</b>
+                                      </a>
+                                      {ch.children.length > 0 && (
+                                        <span style={{ fontSize: '10px', color: '#0369a1', fontWeight: 600 }}>
+                                          ↳ {ch.children.length} {ch.children[0]?.levelBadge || 'Sub-System'}
+                                          {ch.children.length > 1 ? 's' : ''}: {ch.children.map((sub) => sub.name).join(', ')}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td>
+                                    <span className="c a" style={{ fontSize: '10px', fontWeight: 700 }}>
+                                      {ch.levelBadge}
+                                    </span>
+                                  </td>
+                                  <td><b>{ch.items.length}</b></td>
+                                  <td><span style={{ color: '#166534', fontWeight: 600 }}>{c}</span></td>
+                                  <td><span style={{ color: '#0369a1', fontWeight: 600 }}>{p}</span></td>
+                                  <td><span style={{ color: '#64748b' }}>{n}</span></td>
+                                  <td>{renderMiniProgressBar(ch.items)}</td>
+                                  {STATUS_COLUMNS.map((col) => {
+                                    const done = getDoneStageCount(ch.items, col.key);
+                                    const total = ch.items.length;
+                                    const isAllDone = total > 0 && done === total;
+                                    const isPartDone = done > 0 && !isAllDone;
+                                    return (
+                                      <td
+                                        key={col.key}
+                                        className="ct"
+                                        style={{ textAlign: 'center' }}
+                                        title={`${ch.name} — ${col.short}: ${done} of ${total} completed (${col.doneValue})`}
+                                      >
+                                        <span
                                           style={{
-                                            fontSize: '11px',
-                                            padding: '3px 6px',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            minWidth: '24px',
+                                            height: '20px',
+                                            padding: '0 6px',
                                             borderRadius: '4px',
-                                            border: '1px solid #cbd5e1',
-                                            background: isDone(val) ? '#f0fdf4' : '#fffbeb',
-                                            color: isDone(val) ? '#15803d' : '#b45309',
-                                            fontWeight: 600,
-                                            cursor: 'pointer',
-                                          }}
-                                          title={`Change ${col.label}`}
-                                          onChange={async (e) => {
-                                            try {
-                                              await updateEquipmentField(r.id, col.key, e.target.value);
-                                            } catch (err: any) {
-                                              console.error(err.message);
-                                            }
+                                            fontSize: '11px',
+                                            fontWeight: 700,
+                                            background: isAllDone ? '#dcfce7' : isPartDone ? '#e0f2fe' : '#f1f5f9',
+                                            color: isAllDone ? '#166534' : isPartDone ? '#0284c7' : '#64748b',
+                                            border: isAllDone
+                                              ? '1px solid #bbf7d0'
+                                              : isPartDone
+                                              ? '1px solid #bae6fd'
+                                              : '1px solid #e2e8f0',
                                           }}
                                         >
-                                          {col.options.map((opt) => (
-                                            <option key={opt} value={opt}>
-                                              {opt}
-                                            </option>
-                                          ))}
-                                        </select>
-                                      ) : (
-                                        renderStatusChip(val)
-                                      )}
+                                          {done}
+                                        </span>
+                                      </td>
+                                    );
+                                  })}
+                                </tr>
+                              );
+                            })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {kpiFilter === 'prog' && (
+                  <div>{renderStageWiseBars(activeSystem.items)}</div>
+                )}
+
+                {['all', 'Completed', 'In progress', 'Not started'].includes(kpiFilter) && (
+                  <div>
+                    {(() => {
+                      const statusScopedSysKpiItems = activeSystem.items.filter(
+                        (r) => kpiFilter === 'all' || getEquipmentOverallStatus(r) === kpiFilter
+                      );
+                      const availableTypes = getAvailableEquipmentTypes(statusScopedSysKpiItems);
+                      const filteredSysKpiEquip = statusScopedSysKpiItems.filter((r) => {
+                        if (kpiTypeFilter && (r.EquipmentType || '').trim() !== kpiTypeFilter) return false;
+                        if (!kpiSearch) return true;
+                        const q = kpiSearch.toLowerCase();
+                        return (
+                          r.EquipmentTagNo?.toLowerCase().includes(q) ||
+                          r.EquipmentDescription?.toLowerCase().includes(q) ||
+                          r.EquipmentType?.toLowerCase().includes(q) ||
+                          r.SystemNo?.toLowerCase().includes(q) ||
+                          r.SubSystem?.toLowerCase().includes(q) ||
+                          r.BaseLineUTG?.toLowerCase().includes(q) ||
+                          r.PMI?.toLowerCase().includes(q) ||
+                          r.DocumentDrawing?.toLowerCase().includes(q)
+                        );
+                      });
+                      const effectiveSize = equipPageSize > 0 ? equipPageSize : filteredSysKpiEquip.length || 1;
+                      const safePage = Math.min(equipPage, Math.max(1, Math.ceil(filteredSysKpiEquip.length / effectiveSize)));
+                      const pagedSysKpiEquip =
+                        equipPageSize > 0
+                          ? filteredSysKpiEquip.slice((safePage - 1) * effectiveSize, safePage * effectiveSize)
+                          : filteredSysKpiEquip;
+
+                      return (
+                        <>
+                          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap' }}>
+                            <input
+                              className="tsf"
+                              style={{ maxWidth: '340px', margin: 0 }}
+                              placeholder="🔍 Search tag, description, type, sub-system…"
+                              value={kpiSearch}
+                              onChange={(e) => setKpiSearch(e.target.value)}
+                            />
+                            <select
+                              value={kpiTypeFilter}
+                              onChange={(e) => setKpiTypeFilter(e.target.value)}
+                              style={{
+                                padding: '6px 10px',
+                                fontSize: '12px',
+                                borderRadius: '6px',
+                                border: '1px solid var(--bd)',
+                                background: '#ffffff',
+                                color: 'var(--tx)',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                              }}
+                              title="Filter by Equipment Type"
+                            >
+                              <option value="">All Types ({availableTypes.length})</option>
+                              {availableTypes.map(({ type, count }) => (
+                                <option key={type} value={type}>
+                                  {type} ({count})
+                                </option>
+                              ))}
+                            </select>
+                            <span style={{ fontSize: '12px', color: 'var(--mu)' }}>
+                              Showing {filteredSysKpiEquip.length} equipment
+                            </span>
+                          </div>
+
+                          <div
+                            className="tw"
+                            style={{
+                              maxHeight: '420px',
+                              overflowY: 'auto',
+                              overflowX: 'auto',
+                              border: '1px solid var(--bd)',
+                              borderRadius: '8px',
+                            }}
+                          >
+                            <table className="nrep-table">
+                              <thead style={{ position: 'sticky', top: 0, zIndex: 4, background: '#f8fafc', boxShadow: '0 1px 0 var(--bd)' }}>
+                                <tr>
+                                  <th>Tag No.</th>
+                                  <th>Description</th>
+                                  <th>Type</th>
+                                  {activeSystem.children.length > 0 && <th>Sub-System</th>}
+                                  <th>Status</th>
+                                  <th>Progress</th>
+                                  <th>Base Line UTG</th>
+                                  <th>PMI</th>
+                                  <th>Document/Drawing</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {pagedSysKpiEquip.map((r) => (
+                                  <tr key={r.id}>
+                                    <td>
+                                      <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
+                                        <b>{r.EquipmentTagNo}</b>
+                                      </a>
                                     </td>
-                                  );
-                                })}
-                                <td>{renderDocumentDrawing(r.DocumentDrawing)}</td>
-                                {isEditor && (
-                                  <td style={{ textAlign: 'center', whiteSpace: 'nowrap' }}>
-                                    <button
-                                      type="button"
-                                      className="btn btn-sm"
-                                      style={{
-                                        padding: '3px 8px',
-                                        fontSize: '11px',
-                                        display: 'inline-flex',
-                                        alignItems: 'center',
-                                        gap: '4px',
-                                        background: '#f0f7ff',
-                                        color: '#0284c7',
-                                        borderColor: '#bae6fd',
-                                        borderRadius: '4px',
-                                        cursor: 'pointer',
-                                      }}
-                                      title="Edit equipment record"
-                                      onClick={() => setEditingEquipment(r)}
-                                    >
-                                      Edit
-                                    </button>
-                                  </td>
-                                )}
-                              </tr>
-                            );
-                          })}
-                      </tbody>
-                    </table>
+                                    <td>{r.EquipmentDescription || '—'}</td>
+                                    <td>{r.EquipmentType || '—'}</td>
+                                    {activeSystem.children.length > 0 && <td>{r.SubSystem || r.SystemNo || '—'}</td>}
+                                    <td>{renderStatusChip(getEquipmentOverallStatus(r))}</td>
+                                    <td>{calculateProgress([r])}%</td>
+                                    <td>{renderStatusChip(r.BaseLineUTG)}</td>
+                                    <td>{renderStatusChip(r.PMI)}</td>
+                                    <td>{renderDocumentDrawing(r.DocumentDrawing, r)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          {renderPaginationBar(filteredSysKpiEquip.length)}
+                        </>
+                      );
+                    })()}
                   </div>
                 )}
               </div>
-            </div>
+            )}
+
+            {/* Default System / Sub-System Overview when no KPI filter is active */}
+            {!kpiFilter && (
+              <>
+                {/* Child Systems / Sub-Systems Matrix Table (if this System/Sub-Unit has child nodes) */}
+                {activeSystem.children.length > 0 && (
+                  <div className="cd" style={{ marginBottom: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px', marginBottom: '8px' }}>
+                      <h3 style={{ margin: 0 }}>
+                        {activeSystem.children[0]?.levelBadge || 'Sub-System'}s in {activeSystem.name} ({activeSystem.children.length}) — Click any row to open its details
+                      </h3>
+                    </div>
+                    <div className="tw">
+                      <table className="nrep-table">
+                        <thead>
+                          <tr>
+                            <th>{activeSystem.children[0]?.levelBadge || 'Sub-System'} ({activeSystem.name})</th>
+                            <th>Level</th>
+                            <th>Equip.</th>
+                            <th>Completed</th>
+                            <th>In prog.</th>
+                            <th>Not started</th>
+                            <th style={{ minWidth: '150px' }}>Stage Progress</th>
+                            {STATUS_COLUMNS.map((col) => (
+                              <th
+                                key={col.key}
+                                className="ct"
+                                title={`Work completed / issued count (${col.doneValue})`}
+                                style={{ minWidth: '82px', textAlign: 'center' }}
+                              >
+                                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px', width: '100%' }}>
+                                  <span style={{ textAlign: 'center' }}>{col.short}</span>
+                                  <span style={{ fontSize: '9px', textTransform: 'none', color: '#0369a1', fontWeight: 700, textAlign: 'center' }}>
+                                    ({col.doneValue})
+                                  </span>
+                                </div>
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {activeSystem.children.map((ch) => {
+                            const c = ch.items.filter((r) => getEquipmentOverallStatus(r) === 'Completed').length;
+                            const p = ch.items.filter((r) => getEquipmentOverallStatus(r) === 'In progress').length;
+                            const n = ch.items.length - c - p;
+                            return (
+                              <tr key={ch.id}>
+                                <td>
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                    <a href={`#${ch.id}`}>
+                                      <b>{ch.name}</b>
+                                    </a>
+                                    {ch.children.length > 0 && (
+                                      <span style={{ fontSize: '10px', color: '#0369a1', fontWeight: 600 }}>
+                                        ↳ {ch.children.length} {ch.children[0]?.levelBadge || 'Sub-System'}
+                                        {ch.children.length > 1 ? 's' : ''}: {ch.children.map((sub) => sub.name).join(', ')}
+                                      </span>
+                                    )}
+                                  </div>
+                                </td>
+                                <td>
+                                  <span className="c a" style={{ fontSize: '10px', fontWeight: 700 }}>
+                                    {ch.levelBadge}
+                                  </span>
+                                </td>
+                                <td><b>{ch.items.length}</b></td>
+                                <td><span style={{ color: '#166534', fontWeight: 600 }}>{c}</span></td>
+                                <td><span style={{ color: '#0369a1', fontWeight: 600 }}>{p}</span></td>
+                                <td><span style={{ color: '#64748b' }}>{n}</span></td>
+                                <td>{renderMiniProgressBar(ch.items)}</td>
+                                {STATUS_COLUMNS.map((col) => {
+                                  const done = getDoneStageCount(ch.items, col.key);
+                                  const total = ch.items.length;
+                                  const isAllDone = total > 0 && done === total;
+                                  const isPartDone = done > 0 && !isAllDone;
+                                  return (
+                                    <td
+                                      key={col.key}
+                                      className="ct"
+                                      style={{ textAlign: 'center' }}
+                                      title={`${ch.name} — ${col.short}: ${done} of ${total} completed (${col.doneValue})`}
+                                    >
+                                      <span
+                                        style={{
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          justifyContent: 'center',
+                                          minWidth: '24px',
+                                          height: '20px',
+                                          padding: '0 6px',
+                                          borderRadius: '4px',
+                                          fontSize: '11px',
+                                          fontWeight: 700,
+                                          background: isAllDone ? '#dcfce7' : isPartDone ? '#e0f2fe' : '#f1f5f9',
+                                          color: isAllDone ? '#166534' : isPartDone ? '#0284c7' : '#64748b',
+                                          border: isAllDone
+                                            ? '1px solid #bbf7d0'
+                                            : isPartDone
+                                            ? '1px solid #bae6fd'
+                                            : '1px solid #e2e8f0',
+                                        }}
+                                      >
+                                        {done}
+                                      </span>
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                <div className="cd">
+                  <h3>Equipment in {activeSystem.name} ({activeSystem.items.length}) — click a tag for full detail</h3>
+                  {(() => {
+                    const availableSysTypes = getAvailableEquipmentTypes(activeSystem.items);
+                    return (
+                      <div className="tools">
+                        <input
+                          id="q"
+                          placeholder="Search tag, description, type, sub-system, Base Line UTG, Document/Drawing, remarks…"
+                          value={systemSearch}
+                          onChange={(e) => setSystemSearch(e.target.value)}
+                        />
+                        <select
+                          id="tf"
+                          value={systemTypeFilter}
+                          onChange={(e) => setSystemTypeFilter(e.target.value)}
+                          title="Filter by Equipment Type (e.g. Vessel, Exchanger)"
+                        >
+                          <option value="">All Types ({availableSysTypes.length})</option>
+                          {availableSysTypes.map(({ type, count }) => (
+                            <option key={type} value={type}>
+                              {type} ({count})
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          id="sf"
+                          value={systemStatusFilter}
+                          onChange={(e) => setSystemStatusFilter(e.target.value)}
+                        >
+                          <option value="">All Statuses</option>
+                          <option value="Completed">Completed</option>
+                          <option value="In progress">In progress</option>
+                          <option value="Not started">Not started</option>
+                        </select>
+                      </div>
+                    );
+                  })()}
+
+                  <div id="eqt">
+                    {activeSystem.items.length === 0 ? (
+                      <div className="empty">No matching equipment.</div>
+                    ) : (
+                      (() => {
+                        const filteredSysItems = activeSystem.items.filter((r) => {
+                          const q = systemSearch.toLowerCase();
+                          const matchesSearch =
+                            !q || Object.values(r).join(' ').toLowerCase().includes(q);
+                          const matchesFilter =
+                            !systemStatusFilter || getEquipmentOverallStatus(r) === systemStatusFilter;
+                          const matchesType =
+                            !systemTypeFilter || (r.EquipmentType || '').trim() === systemTypeFilter;
+                          return matchesSearch && matchesFilter && matchesType;
+                        });
+
+                        if (filteredSysItems.length === 0) {
+                          return <div className="empty">No matching equipment.</div>;
+                        }
+
+                        const effectiveSize = equipPageSize > 0 ? equipPageSize : filteredSysItems.length || 1;
+                        const safePage = Math.min(equipPage, Math.max(1, Math.ceil(filteredSysItems.length / effectiveSize)));
+                        const pagedSysItems =
+                          equipPageSize > 0
+                            ? filteredSysItems.slice((safePage - 1) * effectiveSize, safePage * effectiveSize)
+                            : filteredSysItems;
+
+                        return (
+                          <>
+                            <div
+                              className="tw"
+                              style={{
+                                maxHeight: '420px',
+                                overflowY: 'auto',
+                                overflowX: 'auto',
+                                border: '1px solid var(--bd)',
+                                borderRadius: '8px',
+                              }}
+                            >
+                              <table className="nrep-table">
+                                <thead style={{ position: 'sticky', top: 0, zIndex: 4, background: '#f8fafc', boxShadow: '0 1px 0 var(--bd)' }}>
+                                  <tr>
+                                    <th>Tag No.</th>
+                                    <th>Description</th>
+                                    <th>Type</th>
+                                    {activeSystem.children.length > 0 && <th>Sub-System</th>}
+                                    <th>Status</th>
+                                    <th>Progress</th>
+                                    {STATUS_COLUMNS.map((col) => (
+                                      <th key={col.key}>{col.short}</th>
+                                    ))}
+                                    <th>Document/Drawing</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {pagedSysItems.map((r) => {
+                                    const overall = getEquipmentOverallStatus(r);
+                                    const eqPct = calculateProgress([r]);
+                                    return (
+                                      <tr key={r.id}>
+                                        <td>
+                                          <a href={`#eq-${encodeURIComponent(r.EquipmentTagNo)}`}>
+                                            <b>{r.EquipmentTagNo}</b>
+                                          </a>
+                                        </td>
+                                        <td>{r.EquipmentDescription || '—'}</td>
+                                        <td>{r.EquipmentType || '—'}</td>
+                                        {activeSystem.children.length > 0 && <td>{r.SubSystem || '—'}</td>}
+                                        <td>{renderStatusChip(overall === 'Not started' ? '' : overall)}</td>
+                                        <td>
+                                          <span className={`pl ${eqPct === 100 ? 'g' : eqPct > 0 ? 'a' : ''}`}>
+                                            {eqPct}%
+                                          </span>
+                                        </td>
+                                        {STATUS_COLUMNS.map((col) => {
+                                          const val = (r[col.key] as string) || col.pendingValue;
+                                          return (
+                                            <td key={col.key}>
+                                              {renderStatusChip(val)}
+                                            </td>
+                                          );
+                                        })}
+                                        <td>{renderDocumentDrawing(r.DocumentDrawing, r)}</td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                            {renderPaginationBar(filteredSysItems.length)}
+                          </>
+                        );
+                      })()
+                    )}
+                  </div>
+                </div>
+
+                <div className="g2">
+                  <div className="cd overall-status-cd">
+                    <h3>Equipment status</h3>
+                    <div className="overall-status-body">
+                      {renderDonutChart(stats)}
+                    </div>
+                  </div>
+                  <div className="cd">
+                    <h3>Stage-wise status</h3>
+                    {renderStageWiseBars(activeSystem.items)}
+                  </div>
+                </div>
+              </>
+            )}
           </>
         )}
 
-        {/* LEVEL 4: EQUIPMENT DETAIL (MATCHING REFERENCE pageE()) */}
-        {viewLevel === 'e' && activeEquipment && (
-          <>
-            <div className="bc">
-              <a href="#" onClick={goToHome}>NREP Project</a> ›{' '}
-              <a href={`#${activeUnit?.id || ''}`}>{activeEquipment.Unit}</a> ›{' '}
-              <a href={`#${activeSystem?.id || ''}`}>{activeEquipment.SystemNo}</a> ›{' '}
-              {activeEquipment.EquipmentTagNo}
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px', marginBottom: '14px' }}>
-              <h2 className="t" style={{ margin: 0 }}>{activeEquipment.EquipmentTagNo}</h2>
-              {isEditor && (
-                <button
-                  type="button"
-                  className="btn"
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '6px',
-                    background: '#0284c7',
-                    color: '#ffffff',
-                    border: '1px solid #0284c7',
-                    fontWeight: 600,
-                    fontSize: '13px',
-                    padding: '8px 16px',
-                    borderRadius: '6px',
-                    cursor: 'pointer',
-                    boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-                  }}
-                  onClick={() => setEditingEquipment(activeEquipment)}
-                >
-                  Edit Equipment Details
-                </button>
-              )}
-            </div>
+        {/* LEVEL 4: CONSOLIDATED EQUIPMENT DETAIL & INLINE EDITOR (SINGLE UNIFIED VIEW) */}
+        {viewLevel === 'e' && activeEquipment && (() => {
+          const currentEq = eqForm || activeEquipment;
+          const { reports: attachedReports } = parseEquipmentDocumentField(activeEquipment.DocumentDrawing);
 
-            {/* Title card with 6-step pipeline */}
-            <div className="cd">
-              <h3>
-                {activeEquipment.EquipmentDescription || ''} · {activeEquipment.EquipmentType || ''} ·{' '}
-                {renderStatusChip(getEquipmentOverallStatus(activeEquipment))} ·{' '}
-                <span className="pl g" style={{ fontSize: '11.5px' }}>
-                  {calculateProgress([activeEquipment])}% Completed
-                </span>
-              </h3>
+          const stageDateFieldMap: Partial<Record<keyof EquipmentItem, keyof EquipmentItem>> = {
+            FormatIStatus: 'FormatIDate',
+            FormatIIStatus: 'FormatIIDate',
+            FormatIIIStatus: 'FormatIIIDate',
+            FormatIVStatus: 'FormatIVDate',
+            FormatVStatus: 'FormatVDate',
+          };
 
-              <div className="pipe">
-                {STATUS_COLUMNS.map((col) => {
-                  const val = (activeEquipment[col.key] as string) || col.pendingValue;
-                  const done = isDone(val);
-                  const borderCls = done ? 'g' : 'a';
+          const unitSubUnitsDatalist = Array.from(
+            new Set([
+              ...(currentEq.Unit === 'MSP' ? MSP_SUB_UNITS : []),
+              ...(currentEq.Unit === 'Utility' ? UTILITY_SUB_UNITS : []),
+              ...equipment
+                .filter((i) => i.Unit === currentEq.Unit)
+                .map((i) => cleanHierarchyField(i.SubUnit))
+                .filter(Boolean),
+            ])
+          );
 
+          const unitSystemsDatalist = Array.from(
+            new Set(
+              equipment
+                .filter(
+                  (i) =>
+                    i.Unit === currentEq.Unit &&
+                    (!cleanHierarchyField(currentEq.SubUnit) ||
+                      cleanHierarchyField(i.SubUnit) === cleanHierarchyField(currentEq.SubUnit))
+                )
+                .map((i) => cleanHierarchyField(i.SystemNo))
+                .filter(Boolean)
+            )
+          );
+
+          const unitSubSystemsDatalist = Array.from(
+            new Set(
+              equipment
+                .filter(
+                  (i) =>
+                    i.Unit === currentEq.Unit &&
+                    (!cleanHierarchyField(currentEq.SystemNo) ||
+                      cleanHierarchyField(i.SystemNo) === cleanHierarchyField(currentEq.SystemNo))
+                )
+                .map((i) => cleanHierarchyField(i.SubSystem))
+                .filter(Boolean)
+            )
+          );
+
+          const parsedOriginalDoc = parseEquipmentDocumentField(activeEquipment.DocumentDrawing);
+          const hasUnsavedEqChanges =
+            eqDrawingRef.trim() !== (parsedOriginalDoc.drawingRef || '').trim() ||
+            (currentEq.EquipmentTagNo || '').trim() !== (activeEquipment.EquipmentTagNo || '').trim() ||
+            (currentEq.Unit || '').trim() !== (activeEquipment.Unit || '').trim() ||
+            cleanHierarchyField(currentEq.SubUnit) !== cleanHierarchyField(activeEquipment.SubUnit) ||
+            cleanHierarchyField(currentEq.SystemNo) !== cleanHierarchyField(activeEquipment.SystemNo) ||
+            cleanHierarchyField(currentEq.SubSystem) !== cleanHierarchyField(activeEquipment.SubSystem) ||
+            (currentEq.EquipmentType || '') !== (activeEquipment.EquipmentType || '') ||
+            (currentEq.EquipmentDescription || '') !== (activeEquipment.EquipmentDescription || '') ||
+            (currentEq.Remarks || '') !== (activeEquipment.Remarks || '') ||
+            (currentEq.FormatIStatus || 'Not Issued') !== (activeEquipment.FormatIStatus || 'Not Issued') ||
+            (currentEq.FormatIIStatus || 'Not Issued') !== (activeEquipment.FormatIIStatus || 'Not Issued') ||
+            (currentEq.FormatIIIStatus || 'Not Issued') !== (activeEquipment.FormatIIIStatus || 'Not Issued') ||
+            (currentEq.FormatIVStatus || 'Not Issued') !== (activeEquipment.FormatIVStatus || 'Not Issued') ||
+            (currentEq.FormatVStatus || 'Not Issued') !== (activeEquipment.FormatVStatus || 'Not Issued') ||
+            (currentEq.InternalInspectionStatus || 'No') !== (activeEquipment.InternalInspectionStatus || 'No') ||
+            (currentEq.BaseLineUTG || 'No') !== (activeEquipment.BaseLineUTG || 'No') ||
+            (currentEq.PMI || 'No') !== (activeEquipment.PMI || 'No') ||
+            (currentEq.FinalSystemAcceptance || 'Not Accepted') !== (activeEquipment.FinalSystemAcceptance || 'Not Accepted') ||
+            (currentEq.FormatIDate || '') !== (activeEquipment.FormatIDate || '') ||
+            (currentEq.FormatIIDate || '') !== (activeEquipment.FormatIIDate || '') ||
+            (currentEq.FormatIIIDate || '') !== (activeEquipment.FormatIIIDate || '') ||
+            (currentEq.FormatIVDate || '') !== (activeEquipment.FormatIVDate || '') ||
+            (currentEq.FormatVDate || '') !== (activeEquipment.FormatVDate || '');
+
+          const handleInlineFormChange = (field: keyof EquipmentItem, value: string) => {
+            setEqSaveNotice(null);
+            setEqForm((prev) => {
+              const base = prev || activeEquipment;
+              return { ...base, [field]: value };
+            });
+          };
+
+          const handleSaveFullEquipment = async () => {
+            if (!isEditor) {
+              setDashboardSweetSuccess({
+                title: 'Access Denied',
+                message: 'You need Editor or Admin permissions to save changes.',
+                badgeText: 'Permission Required',
+              });
+              return;
+            }
+            const target = currentEq;
+            if (!target.EquipmentTagNo.trim()) {
+              setDashboardSweetSuccess({
+                title: 'Validation Error',
+                message: 'Equipment Tag No. is required.',
+                badgeText: 'Required Field',
+              });
+              return;
+            }
+            setSavingEqForm(true);
+            setEqSaveNotice(null);
+            try {
+              const cleanedSubUnit = cleanHierarchyField(target.SubUnit);
+              const cleanedSystem = cleanHierarchyField(target.SystemNo);
+              const cleanedSubSystem = cleanHierarchyField(target.SubSystem);
+              const serializedDoc = serializeEquipmentDocumentField(eqDrawingRef.trim(), attachedReports);
+
+              const payload: EquipmentItem = {
+                ...target,
+                EquipmentTagNo: target.EquipmentTagNo.trim(),
+                Unit: (target.Unit || 'PFCCU').trim(),
+                SubUnit: cleanedSubUnit,
+                SystemNo: cleanedSystem,
+                SubSystem: cleanedSubSystem,
+                DocumentDrawing: serializedDoc,
+              };
+
+              await saveEquipment(payload);
+              setDashboardSweetSuccess({
+                title: 'Equipment Saved Successfully!',
+                message: 'Equipment data sheet & dashboard updated and synced to cloud database.',
+                badgeText: 'Live Cloud Sync Complete',
+                metaItems: [
+                  { label: 'Tag No.', value: payload.EquipmentTagNo, highlight: 'blue' },
+                  { label: 'Unit', value: payload.Unit, highlight: 'green' },
+                ],
+              });
+              if (payload.EquipmentTagNo !== activeEquipment.EquipmentTagNo && typeof window !== 'undefined') {
+                window.location.hash = `#eq-${encodeURIComponent(payload.EquipmentTagNo)}`;
+              }
+            } catch (err: any) {
+              setDashboardSweetSuccess({
+                title: 'Save Failed',
+                message: err?.message || 'Failed to save equipment details.',
+                badgeText: 'Error',
+              });
+            } finally {
+              setSavingEqForm(false);
+            }
+          };
+
+          const handleMarkAllStagesDone = () => {
+            if (!isEditor) return;
+            setEqSaveNotice(null);
+            setEqForm({
+              ...currentEq,
+              FormatIStatus: 'Issued',
+              FormatIIStatus: 'Issued',
+              FormatIIIStatus: 'Issued',
+              FormatIVStatus: 'Issued',
+              FormatVStatus: 'Issued',
+              InternalInspectionStatus: 'Yes',
+              BaseLineUTG: 'Yes',
+              PMI: 'Yes',
+              FinalSystemAcceptance: 'Accepted',
+            });
+          };
+
+          return (
+            <>
+              <div className="bc">
+                <a href="#" onClick={goToHome}>NREP Project</a> ›{' '}
+                <a href={`#${activeUnit?.id || ''}`}>{activeEquipment.Unit}</a>
+                {activeUnit && activeSystem && activeSystem.ancestorIds.map((ancId) => {
+                  const ancNode = activeUnit.systems.find((s) => s.id === ancId);
+                  if (!ancNode) return null;
                   return (
-                    <div key={col.key} className={`st ${borderCls}`}>
-                      <span>{col.short}</span>
-                      {isEditor ? (
-                        <select
-                          value={val}
+                    <React.Fragment key={ancId}>
+                      {' › '}
+                      <a href={`#${ancNode.id}`}>{ancNode.name}</a>
+                    </React.Fragment>
+                  );
+                })}
+                {' › '}
+                {activeEquipment.EquipmentTagNo}
+              </div>
+
+              {/* SINGLE CONSOLIDATED EQUIPMENT DETAIL & EDIT CARD */}
+              <div className="cd" style={{ padding: '18px 20px' }}>
+                {/* Top Header Bar: Tag, Hierarchy Path, Progress Badge & Stage Preset Helpers */}
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap',
+                    gap: '12px',
+                    paddingBottom: '14px',
+                    marginBottom: '16px',
+                    borderBottom: '1px solid #e2e8f0',
+                  }}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                      <h2 className="t" style={{ margin: 0, fontSize: '20px' }}>
+                        {activeEquipment.EquipmentTagNo}
+                      </h2>
+                      {renderStatusChip(getEquipmentOverallStatus(activeEquipment))}
+                      <span className="pl g" style={{ fontSize: '12px', fontWeight: 700 }}>
+                        {calculateProgress([activeEquipment])}% Completed
+                      </span>
+                      {hasUnsavedEqChanges && (
+                        <span
                           style={{
                             fontSize: '11px',
-                            fontWeight: 600,
-                            padding: '3px 6px',
+                            fontWeight: 700,
+                            padding: '2px 8px',
                             borderRadius: '4px',
-                            border: '1px solid #94a3b8',
-                            background: done ? '#f0fdf4' : '#fffbeb',
-                            color: done ? '#15803d' : '#b45309',
-                            cursor: 'pointer',
-                          }}
-                          onChange={async (e) => {
-                            try {
-                              await updateEquipmentField(activeEquipment.id, col.key, e.target.value);
-                            } catch (err: any) {
-                              console.error(err.message);
-                            }
+                            background: '#fffbeb',
+                            color: '#b45309',
+                            border: '1px solid #fcd34d',
                           }}
                         >
-                          {col.options.map((opt) => (
-                            <option key={opt} value={opt}>
-                              {opt}
+                          Unsaved changes — click Save Changes below
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#475569', fontWeight: 500 }}>
+                      <span style={{ fontWeight: 700, color: '#0369a1' }}>
+                        {formatEquipmentHierarchyPath(activeEquipment)}
+                      </span>
+                      {activeEquipment.EquipmentDescription ? ` · ${activeEquipment.EquipmentDescription}` : ''}
+                      {activeEquipment.EquipmentType ? ` · ${activeEquipment.EquipmentType}` : ''}
+                    </div>
+                  </div>
+
+                  {isEditor && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        onClick={handleMarkAllStagesDone}
+                        disabled={savingEqForm}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '5px',
+                          padding: '6px 11px',
+                          fontSize: '11.5px',
+                          fontWeight: 700,
+                          borderRadius: '6px',
+                          background: '#f0fdf4',
+                          color: '#15803d',
+                          border: '1px solid #86efac',
+                          cursor: 'pointer',
+                        }}
+                        title="Set all inspection stages to Done in form (click Save Changes below to update)"
+                      >
+                        <Check size={13} />
+                        All Done
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {eqSaveNotice && (
+                  <div
+                    style={{
+                      marginBottom: '14px',
+                      padding: '8px 12px',
+                      borderRadius: '6px',
+                      fontSize: '12px',
+                      fontWeight: 600,
+                      background: eqSaveNotice.type === 'ok' ? '#f0fdf4' : '#fef2f2',
+                      color: eqSaveNotice.type === 'ok' ? '#15803d' : '#b91c1c',
+                      border: `1px solid ${eqSaveNotice.type === 'ok' ? '#bbf7d0' : '#fecaca'}`,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                    }}
+                  >
+                    <span>{eqSaveNotice.type === 'ok' ? '✓ ' : '⚠ '}{eqSaveNotice.text}</span>
+                    <button
+                      type="button"
+                      onClick={() => setEqSaveNotice(null)}
+                      style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '12px', color: 'inherit' }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
+
+                {/* SECTION 1: IDENTIFICATION & 4-LEVEL HIERARCHY (Unit > Sub-Unit > System > Sub-System) */}
+                <div style={{ marginBottom: '18px' }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      flexWrap: 'wrap',
+                      gap: '6px',
+                      marginBottom: '8px',
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: '11px',
+                        fontWeight: 700,
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.05em',
+                        color: '#475569',
+                      }}
+                    >
+                      1. Identification &amp; Hierarchy (Unit › Sub-Unit › System › Sub-System)
+                    </span>
+                    <span style={{ fontSize: '11px', color: '#64748b' }}>
+                      Blank hierarchy levels automatically attach to the previous filled level
+                    </span>
+                  </div>
+
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(185px, 1fr))',
+                      gap: '10px',
+                      background: '#f8fafc',
+                      padding: '12px',
+                      borderRadius: '8px',
+                      border: '1px solid #e2e8f0',
+                    }}
+                  >
+                    <div>
+                      <label style={{ display: 'block', fontSize: '11px', fontWeight: 700, color: '#475569', marginBottom: '4px' }}>
+                        Equipment Tag No.
+                      </label>
+                      {isEditor ? (
+                        <input
+                          type="text"
+                          value={currentEq.EquipmentTagNo || ''}
+                          onChange={(e) => handleInlineFormChange('EquipmentTagNo', e.target.value)}
+                          style={{
+                            width: '100%',
+                            padding: '6px 9px',
+                            fontSize: '12.5px',
+                            fontWeight: 700,
+                            border: '1px solid #cbd5e1',
+                            borderRadius: '5px',
+                            background: '#ffffff',
+                          }}
+                        />
+                      ) : (
+                        <div style={{ fontSize: '13px', fontWeight: 700, color: '#0f172a' }}>{currentEq.EquipmentTagNo}</div>
+                      )}
+                    </div>
+
+                    <div>
+                      <label style={{ display: 'block', fontSize: '11px', fontWeight: 700, color: '#475569', marginBottom: '4px' }}>
+                        1. Unit
+                      </label>
+                      {isEditor ? (
+                        <select
+                          value={currentEq.Unit || ''}
+                          onChange={(e) => handleInlineFormChange('Unit', e.target.value)}
+                          style={{
+                            width: '100%',
+                            padding: '6px 9px',
+                            fontSize: '12.5px',
+                            fontWeight: 600,
+                            border: '1px solid #cbd5e1',
+                            borderRadius: '5px',
+                            background: '#ffffff',
+                          }}
+                        >
+                          {allUnitsList.map((u) => (
+                            <option key={u} value={u}>
+                              {u}
                             </option>
                           ))}
                         </select>
                       ) : (
-                        <b>{val}</b>
+                        <div style={{ fontSize: '13px', fontWeight: 600, color: '#0f172a' }}>{currentEq.Unit}</div>
                       )}
                     </div>
-                  );
-                })}
-              </div>
-            </div>
 
-            {/* Details Grid */}
-            <div className="cd">
-              <h3>Details</h3>
-              <div className="dg">
-                <div>
-                  <label>Base Line UTG</label>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '11px', fontWeight: 700, color: '#475569', marginBottom: '4px' }}>
+                        2. Sub-Unit <span style={{ fontWeight: 400, color: '#94a3b8' }}>(Optional)</span>
+                      </label>
+                      {isEditor ? (
+                        <>
+                          <input
+                            type="text"
+                            list="eq-detail-subunits"
+                            value={currentEq.SubUnit || ''}
+                            onChange={(e) => handleInlineFormChange('SubUnit', e.target.value)}
+                            placeholder="Skip to attach to Unit"
+                            style={{
+                              width: '100%',
+                              padding: '6px 9px',
+                              fontSize: '12.5px',
+                              border: '1px solid #cbd5e1',
+                              borderRadius: '5px',
+                              background: '#ffffff',
+                            }}
+                          />
+                          <datalist id="eq-detail-subunits">
+                            {unitSubUnitsDatalist.map((su) => (
+                              <option key={su} value={su} />
+                            ))}
+                          </datalist>
+                        </>
+                      ) : (
+                        <div style={{ fontSize: '13px', color: '#0f172a' }}>{cleanHierarchyField(currentEq.SubUnit) || '—'}</div>
+                      )}
+                    </div>
+
+                    <div>
+                      <label style={{ display: 'block', fontSize: '11px', fontWeight: 700, color: '#475569', marginBottom: '4px' }}>
+                        3. System <span style={{ fontWeight: 400, color: '#94a3b8' }}>(Optional)</span>
+                      </label>
+                      {isEditor ? (
+                        <>
+                          <input
+                            type="text"
+                            list="eq-detail-systems"
+                            value={currentEq.SystemNo || ''}
+                            onChange={(e) => handleInlineFormChange('SystemNo', e.target.value)}
+                            placeholder="Skip to attach to previous"
+                            style={{
+                              width: '100%',
+                              padding: '6px 9px',
+                              fontSize: '12.5px',
+                              border: '1px solid #cbd5e1',
+                              borderRadius: '5px',
+                              background: '#ffffff',
+                            }}
+                          />
+                          <datalist id="eq-detail-systems">
+                            {unitSystemsDatalist.map((sys) => (
+                              <option key={sys} value={sys} />
+                            ))}
+                          </datalist>
+                        </>
+                      ) : (
+                        <div style={{ fontSize: '13px', color: '#0f172a' }}>
+                          {cleanHierarchyField(currentEq.SystemNo) || '—'}
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <label style={{ display: 'block', fontSize: '11px', fontWeight: 700, color: '#475569', marginBottom: '4px' }}>
+                        4. Sub-System <span style={{ fontWeight: 400, color: '#94a3b8' }}>(Optional)</span>
+                      </label>
+                      {isEditor ? (
+                        <>
+                          <input
+                            type="text"
+                            list="eq-detail-subsystems"
+                            value={currentEq.SubSystem || ''}
+                            onChange={(e) => handleInlineFormChange('SubSystem', e.target.value)}
+                            placeholder="Skip to attach to previous"
+                            style={{
+                              width: '100%',
+                              padding: '6px 9px',
+                              fontSize: '12.5px',
+                              border: '1px solid #cbd5e1',
+                              borderRadius: '5px',
+                              background: '#ffffff',
+                            }}
+                          />
+                          <datalist id="eq-detail-subsystems">
+                            {unitSubSystemsDatalist.map((subSys) => (
+                              <option key={subSys} value={subSys} />
+                            ))}
+                          </datalist>
+                        </>
+                      ) : (
+                        <div style={{ fontSize: '13px', color: '#0f172a' }}>{cleanHierarchyField(currentEq.SubSystem) || '—'}</div>
+                      )}
+                    </div>
+
+                    <div>
+                      <label style={{ display: 'block', fontSize: '11px', fontWeight: 700, color: '#475569', marginBottom: '4px' }}>
+                        Equipment Type
+                      </label>
+                      {isEditor ? (
+                        <input
+                          type="text"
+                          value={currentEq.EquipmentType || ''}
+                          onChange={(e) => handleInlineFormChange('EquipmentType', e.target.value)}
+                          placeholder="e.g. Static / Vessel / Column"
+                          style={{
+                            width: '100%',
+                            padding: '6px 9px',
+                            fontSize: '12.5px',
+                            border: '1px solid #cbd5e1',
+                            borderRadius: '5px',
+                            background: '#ffffff',
+                          }}
+                        />
+                      ) : (
+                        <div style={{ fontSize: '13px', color: '#0f172a' }}>{currentEq.EquipmentType || '—'}</div>
+                      )}
+                    </div>
+
+                    <div style={{ gridColumn: '1 / -1' }}>
+                      <label style={{ display: 'block', fontSize: '11px', fontWeight: 700, color: '#475569', marginBottom: '4px' }}>
+                        Equipment Description
+                      </label>
+                      {isEditor ? (
+                        <input
+                          type="text"
+                          value={currentEq.EquipmentDescription || ''}
+                          onChange={(e) => handleInlineFormChange('EquipmentDescription', e.target.value)}
+                          placeholder="Equipment service / description"
+                          style={{
+                            width: '100%',
+                            padding: '6px 9px',
+                            fontSize: '12.5px',
+                            border: '1px solid #cbd5e1',
+                            borderRadius: '5px',
+                            background: '#ffffff',
+                          }}
+                        />
+                      ) : (
+                        <div style={{ fontSize: '13px', color: '#0f172a' }}>{currentEq.EquipmentDescription || '—'}</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* SECTION 2: CONSOLIDATED 9 INSPECTION STAGES + INLINE FORMAT DATES (ZERO DUPLICATION) */}
+                <div style={{ marginBottom: '18px' }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      flexWrap: 'wrap',
+                      gap: '6px',
+                      marginBottom: '8px',
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: '11px',
+                        fontWeight: 700,
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.05em',
+                        color: '#475569',
+                      }}
+                    >
+                      2. Inspection Stages &amp; Format Issue Dates
+                    </span>
+                    <span style={{ fontSize: '11px', color: '#64748b' }}>
+                      Progress % is calculated from the 7 core stages (Base Line UTG &amp; PMI are excluded from %)
+                    </span>
+                  </div>
+
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(175px, 1fr))',
+                      gap: '10px',
+                    }}
+                  >
+                    {STATUS_COLUMNS.map((col) => {
+                      const val = (currentEq[col.key] as string) || col.pendingValue;
+                      const done = isDone(val);
+                      const dateField = stageDateFieldMap[col.key];
+                      const dateVal = dateField ? ((currentEq[dateField] as string) || '') : '';
+                      const isExcludedFromPct = col.key === 'BaseLineUTG' || col.key === 'PMI';
+
+                      return (
+                        <div
+                          key={col.key}
+                          style={{
+                            borderRadius: '8px',
+                            padding: '10px 12px',
+                            border: done ? '1px solid #86efac' : '1px solid #fcd34d',
+                            borderLeft: done ? '4px solid #16a34a' : '4px solid #f59e0b',
+                            background: done ? '#f0fdf4' : '#fffbeb',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            justifyContent: 'space-between',
+                            gap: '8px',
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '4px' }}>
+                            <span style={{ fontSize: '11.5px', fontWeight: 700, color: '#0f172a' }}>{col.label}</span>
+                            {isExcludedFromPct && (
+                              <span
+                                style={{
+                                  fontSize: '9.5px',
+                                  fontWeight: 600,
+                                  padding: '1px 5px',
+                                  borderRadius: '4px',
+                                  background: 'rgba(15, 23, 42, 0.07)',
+                                  color: '#475569',
+                                }}
+                                title="Tracked for records; excluded from % progress calculation"
+                              >
+                                Info
+                              </span>
+                            )}
+                          </div>
+
+                          <div>
+                            {isEditor ? (
+                              <select
+                                value={val}
+                                onChange={(e) => handleInlineFormChange(col.key, e.target.value)}
+                                style={{
+                                  width: '100%',
+                                  fontSize: '12px',
+                                  fontWeight: 700,
+                                  padding: '5px 8px',
+                                  borderRadius: '5px',
+                                  border: done ? '1px solid #4ade80' : '1px solid #fbbf24',
+                                  background: '#ffffff',
+                                  color: done ? '#15803d' : '#b45309',
+                                  cursor: 'pointer',
+                                }}
+                              >
+                                {col.options.map((opt) => (
+                                  <option key={opt} value={opt}>
+                                    {opt}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <div
+                                style={{
+                                  fontSize: '12.5px',
+                                  fontWeight: 700,
+                                  color: done ? '#15803d' : '#b45309',
+                                }}
+                              >
+                                {val}
+                              </div>
+                            )}
+                          </div>
+
+                          {dateField && (
+                            <div style={{ borderTop: '1px dashed rgba(100, 116, 139, 0.25)', paddingTop: '6px' }}>
+                              <label
+                                style={{
+                                  display: 'block',
+                                  fontSize: '10px',
+                                  fontWeight: 600,
+                                  color: '#475569',
+                                  marginBottom: '3px',
+                                }}
+                              >
+                                Issue Date
+                              </label>
+                              {isEditor ? (
+                                <input
+                                  type="date"
+                                  value={dateVal}
+                                  onChange={(e) => handleInlineFormChange(dateField, e.target.value)}
+                                  style={{
+                                    width: '100%',
+                                    fontSize: '11.5px',
+                                    padding: '4px 6px',
+                                    borderRadius: '4px',
+                                    border: '1px solid #cbd5e1',
+                                    background: '#ffffff',
+                                    color: '#0f172a',
+                                  }}
+                                />
+                              ) : (
+                                <div style={{ fontSize: '11.5px', color: '#334155', fontWeight: 600 }}>
+                                  {dateVal || '—'}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* SECTION 3: DOCUMENT / DRAWING, LIVE INSPECTION REPORTS & REMARKS */}
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(290px, 1fr))',
+                    gap: '14px',
+                    background: '#f8fafc',
+                    padding: '12px',
+                    borderRadius: '8px',
+                    border: '1px solid #e2e8f0',
+                  }}
+                >
                   <div>
+                    <label
+                      style={{
+                        display: 'block',
+                        fontSize: '11px',
+                        fontWeight: 700,
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.04em',
+                        color: '#475569',
+                        marginBottom: '6px',
+                      }}
+                    >
+                      3. Document / Drawing Ref. &amp; Live Inspection Reports
+                    </label>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      {isEditor ? (
+                        <input
+                          type="text"
+                          value={eqDrawingRef}
+                          onChange={(e) => {
+                            setEqSaveNotice(null);
+                            setEqDrawingRef(e.target.value);
+                          }}
+                          placeholder="Drawing / Document Reference No. or URL"
+                          style={{
+                            width: '100%',
+                            padding: '6px 9px',
+                            fontSize: '12.5px',
+                            border: '1px solid #cbd5e1',
+                            borderRadius: '5px',
+                            background: '#ffffff',
+                          }}
+                        />
+                      ) : (
+                        <div style={{ fontSize: '12.5px', fontWeight: 600, color: '#0f172a' }}>
+                          {eqDrawingRef ? `📄 ${eqDrawingRef}` : 'No drawing reference specified'}
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        {isEditor && (
+                          <button
+                            type="button"
+                            onClick={() => setReportModalState({ item: activeEquipment, tab: 'attach' })}
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '5px',
+                              padding: '5px 10px',
+                              fontSize: '11.5px',
+                              fontWeight: 600,
+                              borderRadius: '5px',
+                              background: '#ffffff',
+                              color: '#0284c7',
+                              border: '1px dashed #0284c7',
+                              cursor: 'pointer',
+                              whiteSpace: 'nowrap',
+                            }}
+                            title="Upload PDF/Image report or attach Google Drive / OneDrive link"
+                          >
+                            ⬆️ Upload / Link
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setReportModalState({
+                              item: activeEquipment,
+                              tab: 'view',
+                              viewOnly: true,
+                            })
+                          }
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '5px',
+                            padding: '5px 10px',
+                            fontSize: '11.5px',
+                            fontWeight: 600,
+                            borderRadius: '5px',
+                            background: '#0f172a',
+                            color: '#ffffff',
+                            border: '1px solid #334155',
+                            cursor: 'pointer',
+                            whiteSpace: 'nowrap',
+                          }}
+                          title="View uploaded inspection reports for this equipment"
+                        >
+                          <FileText size={12} />
+                          <span>Live Inspection Reports ({attachedReports.length})</span>
+                        </button>
+
+                        {eqDrawingRef && /^https?:\/\//i.test(eqDrawingRef) && (
+                          <a
+                            className="btn"
+                            href={eqDrawingRef}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              padding: '5px 10px',
+                              fontSize: '11.5px',
+                              fontWeight: 600,
+                              borderRadius: '5px',
+                            }}
+                          >
+                            Open Drawing URL ↗
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label
+                      style={{
+                        display: 'block',
+                        fontSize: '11px',
+                        fontWeight: 700,
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.04em',
+                        color: '#475569',
+                        marginBottom: '6px',
+                      }}
+                    >
+                      4. Remarks / Inspection Notes
+                    </label>
                     {isEditor ? (
-                      <select
-                        value={activeEquipment.BaseLineUTG || 'No'}
-                        onChange={(e) => updateEquipmentField(activeEquipment.id, 'BaseLineUTG', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc', fontWeight: 600 }}
+                      <textarea
+                        rows={3}
+                        value={currentEq.Remarks || ''}
+                        onChange={(e) => handleInlineFormChange('Remarks', e.target.value)}
+                        placeholder="Add remarks, observations, or inspection notes…"
+                        style={{
+                          width: '100%',
+                          padding: '6px 9px',
+                          fontSize: '12.5px',
+                          border: '1px solid #cbd5e1',
+                          borderRadius: '5px',
+                          background: '#ffffff',
+                          resize: 'vertical',
+                        }}
+                      />
+                    ) : (
+                      <div style={{ fontSize: '12.5px', color: '#0f172a', whiteSpace: 'pre-wrap' }}>
+                        {currentEq.Remarks || '—'}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* BOTTOM FOOTER INSIDE CONSOLIDATED CARD: METADATA, DELETE (ADMIN) & SINGLE SAVE BUTTON */}
+                <div
+                  style={{
+                    marginTop: '14px',
+                    paddingTop: '12px',
+                    borderTop: '1px solid #e2e8f0',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap',
+                    gap: '10px',
+                  }}
+                >
+                  <div style={{ fontSize: '11.5px', color: '#64748b' }}>
+                    {activeEquipment.updatedAt
+                      ? `Last updated: ${new Date(activeEquipment.updatedAt).toLocaleString()}`
+                      : 'Synced with live database'}
+                    {activeEquipment.updatedBy ? ` by ${activeEquipment.updatedBy}` : ''}
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    {canAccessLiveDatabase && (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteEq(true)}
+                        disabled={deletingEq}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '5px',
+                          padding: '7px 14px',
+                          fontSize: '12.5px',
+                          fontWeight: 600,
+                          borderRadius: '6px',
+                          background: '#fef2f2',
+                          color: '#dc2626',
+                          border: '1px solid #fecaca',
+                          cursor: 'pointer',
+                        }}
                       >
-                        <option value="Yes">Yes</option>
-                        <option value="No">No</option>
-                      </select>
-                    ) : (
-                      activeEquipment.BaseLineUTG || 'No'
+                        <Trash2 size={14} />
+                        Delete Equipment
+                      </button>
                     )}
-                  </div>
-                </div>
 
-                <div>
-                  <label>Document/Drawing</label>
-                  <div>
-                    {isEditor ? (
-                      <input
-                        type="text"
-                        defaultValue={activeEquipment.DocumentDrawing || ''}
-                        placeholder="Drawing No. or Document URL"
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'DocumentDrawing', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
-                    ) : (
-                      renderDocumentDrawing(activeEquipment.DocumentDrawing)
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <label>Format-I date</label>
-                  <div>
-                    {isEditor ? (
-                      <input
-                        type="date"
-                        defaultValue={activeEquipment.FormatIDate || ''}
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'FormatIDate', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
-                    ) : (
-                      activeEquipment.FormatIDate || '—'
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <label>Format-II date</label>
-                  <div>
-                    {isEditor ? (
-                      <input
-                        type="date"
-                        defaultValue={activeEquipment.FormatIIDate || ''}
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'FormatIIDate', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
-                    ) : (
-                      activeEquipment.FormatIIDate || '—'
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <label>Format-III date</label>
-                  <div>
-                    {isEditor ? (
-                      <input
-                        type="date"
-                        defaultValue={activeEquipment.FormatIIIDate || ''}
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'FormatIIIDate', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
-                    ) : (
-                      activeEquipment.FormatIIIDate || '—'
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <label>Punch points category closed</label>
-                  <div>
-                    {isEditor ? (
-                      <input
-                        type="text"
-                        defaultValue={activeEquipment.PunchPointsCategoryClosed || ''}
-                        onBlur={(e) =>
-                          updateEquipmentField(activeEquipment.id, 'PunchPointsCategoryClosed', e.target.value)
-                        }
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
-                    ) : (
-                      activeEquipment.PunchPointsCategoryClosed || '—'
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <label>Remarks</label>
-                  <div>
-                    {isEditor ? (
-                      <input
-                        type="text"
-                        defaultValue={activeEquipment.Remarks || ''}
-                        onBlur={(e) => updateEquipmentField(activeEquipment.id, 'Remarks', e.target.value)}
-                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #cbd5e1', borderRadius: '4px', background: '#f8fafc' }}
-                      />
-                    ) : (
-                      activeEquipment.Remarks || '—'
+                    {isEditor && (
+                      <button
+                        type="button"
+                        onClick={() => handleSaveFullEquipment()}
+                        disabled={savingEqForm}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          padding: '7px 16px',
+                          fontSize: '12.5px',
+                          fontWeight: 700,
+                          borderRadius: '6px',
+                          background: '#0284c7',
+                          color: '#ffffff',
+                          border: '1px solid #0284c7',
+                          cursor: 'pointer',
+                          boxShadow: hasUnsavedEqChanges
+                            ? '0 0 0 3px rgba(2, 132, 199, 0.25)'
+                            : '0 1px 2px rgba(2, 132, 199, 0.2)',
+                        }}
+                      >
+                        <Save size={14} />
+                        {savingEqForm ? 'Saving…' : 'Save Changes'}
+                      </button>
                     )}
                   </div>
                 </div>
               </div>
 
-              {activeEquipment.DocumentDrawing && /^https?:\/\//i.test(activeEquipment.DocumentDrawing) && (
-                <p style={{ marginTop: '14px' }}>
-                  <a className="btn" href={activeEquipment.DocumentDrawing} target="_blank" rel="noopener noreferrer">
-                    Open Document / Drawing ↗
-                  </a>
-                </p>
-              )}
-            </div>
+              {/* SweetAlert Warning Delete Confirmation Popup */}
+              <SweetWarningDeletePopup
+                open={confirmDeleteEq}
+                title="Delete Equipment?"
+                targetName={activeEquipment.EquipmentTagNo}
+                targetType="Equipment Record"
+                description={`Are you sure you want to permanently delete "${activeEquipment.EquipmentTagNo}" from ${activeEquipment.Unit}?`}
+                warningNote="This will remove the equipment record from the live database."
+                confirmLabel="Yes, Delete Equipment"
+                cancelLabel="Cancel"
+                loading={deletingEq}
+                onCancel={() => setConfirmDeleteEq(false)}
+                onConfirm={async () => {
+                  setDeletingEq(true);
+                  try {
+                    await deleteEquipment(activeEquipment.id);
+                    setConfirmDeleteEq(false);
+                    if (typeof window !== 'undefined') {
+                      window.location.hash = activeSystem ? `#${activeSystem.id}` : `#${activeUnit?.id || ''}`;
+                    }
+                  } catch (err: any) {
+                    setEqSaveNotice({ type: 'err', text: err?.message || 'Failed to delete equipment.' });
+                    setConfirmDeleteEq(false);
+                  } finally {
+                    setDeletingEq(false);
+                  }
+                }}
+              />
 
-            {/* Sibling navigation */}
-            {(() => {
-              const siblings = activeSystem ? activeSystem.items : [];
-              const currIdx = siblings.findIndex((x) => x.id === activeEquipment.id);
-              const prev = currIdx > 0 ? siblings[currIdx - 1] : null;
-              const next = currIdx >= 0 && currIdx < siblings.length - 1 ? siblings[currIdx + 1] : null;
+              {/* Sibling navigation */}
+              {(() => {
+                const siblings = activeSystem ? activeSystem.items : activeUnit ? activeUnit.items : [];
+                const currIdx = siblings.findIndex((x) => x.id === activeEquipment.id);
+                const prev = currIdx > 0 ? siblings[currIdx - 1] : null;
+                const next = currIdx >= 0 && currIdx < siblings.length - 1 ? siblings[currIdx + 1] : null;
 
-              return (
-                <div className="nv">
-                  <span>
-                    {prev && (
-                      <a href={`#eq-${encodeURIComponent(prev.EquipmentTagNo)}`}>
-                        ← {prev.EquipmentTagNo}
-                      </a>
-                    )}
-                  </span>
-                  <a href={`#${activeSystem?.id || ''}`}>Back to system</a>
-                  <span>
-                    {next && (
-                      <a href={`#eq-${encodeURIComponent(next.EquipmentTagNo)}`}>
-                        {next.EquipmentTagNo} →
-                      </a>
-                    )}
-                  </span>
-                </div>
-              );
-            })()}
-          </>
-        )}
+                return (
+                  <div className="nv">
+                    <span>
+                      {prev && (
+                        <a href={`#eq-${encodeURIComponent(prev.EquipmentTagNo)}`}>
+                          ← {prev.EquipmentTagNo}
+                        </a>
+                      )}
+                    </span>
+                    <a href={`#${activeSystem?.id || activeUnit?.id || ''}`}>
+                      {activeSystem ? `Back to ${activeSystem.name}` : `Back to ${activeEquipment.Unit}`}
+                    </a>
+                    <span>
+                      {next && (
+                        <a href={`#eq-${encodeURIComponent(next.EquipmentTagNo)}`}>
+                          {next.EquipmentTagNo} →
+                        </a>
+                      )}
+                    </span>
+                  </div>
+                );
+              })()}
+            </>
+          );
+        })()}
 
         {/* TASK VIEW: EXCEL & DATA MANAGEMENT TOOLS IN RIGHT PANE */}
         {viewLevel === 'tools' && (
-          <div style={{ maxWidth: '1180px', margin: '0 auto' }}>
-            <div className="bc">
-              <a href="#" onClick={goToHome}>
+          <div className="max-w-[1220px] mx-auto space-y-5 py-1">
+            {/* Breadcrumb Navigation */}
+            <div className="flex items-center gap-2 text-xs text-slate-500 font-medium">
+              <a
+                href="#"
+                onClick={goToHome}
+                className="text-sky-700 hover:text-sky-900 hover:underline font-semibold"
+              >
                 NREP Project
-              </a>{' '}
-              › Excel &amp; Data Tools
+              </a>
+              <span aria-hidden="true">›</span>
+              <span className="text-slate-700 font-semibold">Excel &amp; Data Management Suite</span>
             </div>
 
+            {/* Executive Hero Banner */}
             <div
+              className="rounded-2xl p-5 sm:p-6 text-white relative overflow-hidden"
               style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                flexWrap: 'wrap',
-                gap: '12px',
-                marginBottom: '16px',
+                background: 'linear-gradient(135deg, #09192f 0%, #0f294a 55%, #1e3a8a 100%)',
+                boxShadow:
+                  '0 20px 40px -15px rgba(15, 23, 42, 0.35), 0 0 0 1px rgba(56, 189, 248, 0.22)',
               }}
             >
-              <div>
-                <h1 style={{ margin: 0 }}>🛠️ Excel &amp; Data Management Tools</h1>
-                <p style={{ margin: '4px 0 0', fontSize: '12.5px', color: 'var(--mu)' }}>
-                  Import updated Excel spreadsheets, download standardized 18-column templates (including Base Line UTG &amp; Document/Drawing), or export the live database ({equipment.length} equipment records).
-                </p>
-              </div>
-              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                {(isAdmin || isEditor) && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      window.location.hash = 'admin';
-                      setViewLevel('admin');
-                    }}
+              <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                <div className="flex items-start gap-3.5">
+                  <div
+                    className="w-11 h-11 rounded-xl flex items-center justify-center shrink-0 mt-0.5"
                     style={{
-                      background: 'var(--ac)',
-                      color: '#fff',
-                      border: 'none',
-                      padding: '8px 14px',
-                      borderRadius: '6px',
-                      fontSize: '12px',
-                      fontWeight: 700,
-                      cursor: 'pointer',
+                      background:
+                        'linear-gradient(135deg, rgba(56, 189, 248, 0.24) 0%, rgba(16, 185, 129, 0.16) 100%)',
+                      border: '1px solid rgba(56, 189, 248, 0.4)',
+                      boxShadow: 'inset 0 1px 1px rgba(255, 255, 255, 0.2)',
                     }}
                   >
-                    ⚙️ Open Live Database Editor
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={goToHome}
-                  style={{
-                    background: 'var(--cd)',
-                    color: 'var(--tx)',
-                    border: '1px solid var(--bd)',
-                    padding: '8px 14px',
-                    borderRadius: '6px',
-                    fontSize: '12px',
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                  }}
-                >
-                  ← Back to Dashboard
-                </button>
+                    <FileSpreadsheet className="w-5 h-5 text-sky-300" />
+                  </div>
+                  <div>
+                    <div className="text-[11px] font-semibold uppercase tracking-widest text-sky-300/90 mb-1">
+                      NRL Data Synchronization &amp; Spreadsheet Engine
+                    </div>
+                    <h1 className="text-lg sm:text-xl font-extrabold tracking-tight text-white m-0">
+                      Excel &amp; Data Management Tools
+                    </h1>
+                    <p className="text-xs text-slate-300 mt-1 max-w-2xl leading-relaxed m-0">
+                      Synchronize field inspection spreadsheets with the live Supabase Cloud database, generate standardized 18-column templates, or export complete audit-ready equipment registers.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Live Unboxed Telemetry Summary */}
+                <div className="flex items-center gap-5 pt-3 md:pt-0 border-t md:border-t-0 border-white/10 shrink-0">
+                  <div>
+                    <div className="text-[10.5px] uppercase tracking-wider text-slate-400 font-semibold">
+                      Live Register
+                    </div>
+                    <div className="text-lg font-extrabold font-mono text-white tabular-nums">
+                      {equipment.length} <span className="text-xs font-normal text-sky-300">Tags</span>
+                    </div>
+                  </div>
+                  <div className="h-7 w-px bg-white/15" />
+                  <div>
+                    <div className="text-[10.5px] uppercase tracking-wider text-slate-400 font-semibold">
+                      Completed
+                    </div>
+                    <div className="text-lg font-extrabold font-mono text-emerald-400 tabular-nums">
+                      {stats.completed}{' '}
+                      <span className="text-xs font-normal text-slate-300">
+                        ({stats.progressPct}%)
+                      </span>
+                    </div>
+                  </div>
+                  <div className="h-7 w-px bg-white/15" />
+                  <div>
+                    <div className="text-[10.5px] uppercase tracking-wider text-slate-400 font-semibold">
+                      Active Scope
+                    </div>
+                    <div className="text-lg font-extrabold font-mono text-sky-300 tabular-nums">
+                      {treeData.length} <span className="text-xs font-normal text-slate-300">Units</span>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
 
+            {/* Status Notice Popup Window (Auto-hides after 3 seconds) */}
             {excelNotice && (
               <div
-                style={{
-                  marginBottom: '16px',
-                  padding: '12px 16px',
-                  borderRadius: '8px',
-                  fontSize: '12.5px',
-                  fontWeight: 600,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  background: excelNotice.type === 'ok' ? '#dcfce7' : '#fee2e2',
-                  color: excelNotice.type === 'ok' ? '#166534' : '#991b1b',
-                  border: `1px solid ${excelNotice.type === 'ok' ? '#86efac' : '#fca5a5'}`,
-                }}
+                className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4 animate-in fade-in duration-200"
+                onClick={() => setExcelNotice(null)}
               >
-                <span>{excelNotice.text}</span>
-                <button
-                  type="button"
-                  onClick={() => setExcelNotice(null)}
-                  style={{
-                    background: 'transparent',
-                    border: 'none',
-                    color: 'inherit',
-                    cursor: 'pointer',
-                    fontWeight: 700,
-                  }}
+                <div
+                  className={`relative w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl border-2 transition-all ${
+                    excelNotice.type === 'ok'
+                      ? 'border-emerald-500/40'
+                      : 'border-rose-500/50'
+                  }`}
+                  onClick={(e) => e.stopPropagation()}
                 >
-                  ✕
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => setExcelNotice(null)}
+                    className="absolute top-3.5 right-3.5 w-7 h-7 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                    aria-label="Close notification"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+
+                  <div className="flex flex-col items-center text-center">
+                    <div
+                      className={`w-12 h-12 rounded-2xl flex items-center justify-center mb-3.5 shadow-sm ${
+                        excelNotice.type === 'ok'
+                          ? 'bg-emerald-100 text-emerald-600 border border-emerald-200'
+                          : 'bg-rose-100 text-rose-600 border border-rose-200'
+                      }`}
+                    >
+                      {excelNotice.type === 'ok' ? (
+                        <CheckCircle2 className="w-6 h-6" />
+                      ) : (
+                        <Lock className="w-6 h-6" />
+                      )}
+                    </div>
+
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider mb-2 ${
+                        excelNotice.type === 'ok'
+                          ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                          : 'bg-rose-50 text-rose-700 border border-rose-200'
+                      }`}
+                    >
+                      {excelNotice.type === 'ok' ? 'Upload Synced' : 'Permission / Upload Error'}
+                    </span>
+
+                    <h3 className="text-base font-extrabold text-slate-900 mb-1.5">
+                      {excelNotice.type === 'ok' ? 'Upload Successful' : 'Upload Blocked'}
+                    </h3>
+
+                    <p
+                      className={`text-xs font-semibold leading-relaxed px-3 py-2.5 rounded-xl border w-full ${
+                        excelNotice.type === 'ok'
+                          ? 'bg-emerald-50/70 text-emerald-900 border-emerald-200'
+                          : 'bg-rose-50/80 text-rose-900 border-rose-200'
+                      }`}
+                    >
+                      {excelNotice.text}
+                    </p>
+
+                    <div className="mt-4 flex items-center justify-between w-full gap-3">
+                      <span className="text-[11px] text-slate-400 font-medium">
+                        Auto-closing in 3 seconds...
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setExcelNotice(null)}
+                        className={`px-4 py-1.5 rounded-lg text-xs font-bold text-white shadow-xs transition-colors cursor-pointer ${
+                          excelNotice.type === 'ok'
+                            ? 'bg-emerald-600 hover:bg-emerald-700'
+                            : 'bg-rose-600 hover:bg-rose-700'
+                        }`}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                </div>
               </div>
             )}
 
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
-                gap: '16px',
-                marginBottom: '18px',
-              }}
-            >
-              {/* Card 1: Upload Excel */}
+            {/* 4-Column Executive Tool Cards Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Card 01: Live Spreadsheet Import (Primary Focal Card) */}
               <div
-                className="card"
+                className="rounded-xl bg-white p-5 flex flex-col justify-between transition-all"
                 style={{
-                  border: '1.5px dashed var(--ac)',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  justifyContent: 'space-between',
-                  padding: '20px',
+                  border: '1px solid #bae6fd',
+                  background: 'linear-gradient(180deg, #f0f9ff 0%, #ffffff 65%)',
+                  boxShadow: '0 4px 20px -4px rgba(2, 132, 199, 0.1)',
                 }}
               >
                 <div>
-                  <div style={{ fontSize: '28px', marginBottom: '8px' }}>📊</div>
-                  <h3 style={{ margin: '0 0 6px', fontSize: '15px', color: 'var(--tx)' }}>
-                    Upload Updated Excel File
-                  </h3>
-                  <p style={{ fontSize: '12px', color: 'var(--mu)', lineHeight: 1.5, margin: '0 0 16px' }}>
-                    Upload an <b>.xlsx</b>, <b>.xlsm</b>, or <b>.xls</b> spreadsheet. Existing equipment tags are updated automatically and new tags are added to Cloud Firestore.
-                  </p>
+                  <div className="flex items-center justify-between gap-2 mb-3">
+                    <span className="text-[11px] font-mono font-bold uppercase tracking-wider text-sky-700">
+                      01 · Live Database Upsert
+                    </span>
+                    <span className="text-[11px] text-slate-500 font-mono">
+                      .xlsx · .xlsm · .xls
+                    </span>
+                  </div>
+
+                  <div className="flex items-start gap-3 mb-3">
+                    <div className="w-10 h-10 rounded-xl bg-sky-600 text-white flex items-center justify-center shrink-0 shadow-xs">
+                      <Upload className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-900 m-0">
+                        Import &amp; Sync Excel Spreadsheet
+                      </h3>
+                      <p className="text-xs text-slate-600 mt-1 leading-relaxed m-0">
+                        Upload an updated master spreadsheet. Existing equipment tags are updated automatically and new tags are inserted directly into Supabase Cloud.
+                      </p>
+                    </div>
+                  </div>
                 </div>
-                {isEditor ? (
+
+                <div className="pt-3 border-t border-sky-100">
+                  {isEditor ? (
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="w-full py-2.5 px-4 rounded-lg text-xs font-bold text-white flex items-center justify-center gap-2 cursor-pointer transition-all shadow-xs"
+                      style={{
+                        background: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)',
+                      }}
+                    >
+                      <Upload className="w-4 h-4" />
+                      <span>Choose Excel File to Import</span>
+                    </button>
+                  ) : (
+                    <div className="py-2 px-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-xs font-medium flex items-center justify-center gap-1.5">
+                      <Lock className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                      <span>Editor or Admin role required to import Excel files</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Card 02: Export Live Database to Excel */}
+              <div className="rounded-xl bg-white p-5 border border-slate-200/90 shadow-2xs flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between gap-2 mb-3">
+                    <span className="text-[11px] font-mono font-bold uppercase tracking-wider text-emerald-700">
+                      02 · Full Register Snapshot
+                    </span>
+                    <span className="text-[11px] text-slate-500 font-mono">
+                      {equipment.length} Active Records
+                    </span>
+                  </div>
+
+                  <div className="flex items-start gap-3 mb-3">
+                    <div className="w-10 h-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0 shadow-xs">
+                      <Database className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-900 m-0">
+                        Export Live Database to Excel
+                      </h3>
+                      <p className="text-xs text-slate-600 mt-1 leading-relaxed m-0">
+                        Download a complete, timestamped Excel register of all <b>{equipment.length}</b> equipment tags including 6-stage statuses, Base Line UTG, dates, drawings, and remarks.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="pt-3 border-t border-slate-100">
                   <button
                     type="button"
-                    onClick={() => fileInputRef.current?.click()}
+                    onClick={handleExcelDownload}
+                    className="w-full py-2.5 px-4 rounded-lg text-xs font-bold text-white flex items-center justify-center gap-2 cursor-pointer transition-all shadow-xs"
                     style={{
-                      width: '100%',
-                      background: 'var(--ac)',
-                      color: '#fff',
-                      border: 'none',
-                      padding: '10px 14px',
-                      fontSize: '12.5px',
-                      fontWeight: 700,
-                      borderRadius: '6px',
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      gap: '6px',
+                      background: 'linear-gradient(135deg, #059669 0%, #047857 100%)',
                     }}
                   >
-                    <span>⬆️</span> Choose Excel File to Upload
+                    <Download className="w-4 h-4" />
+                    <span>Export All {equipment.length} Records (.xlsx)</span>
                   </button>
-                ) : (
-                  <div
-                    style={{
-                      fontSize: '11.5px',
-                      color: 'var(--am)',
-                      background: 'var(--amb)',
-                      padding: '8px 10px',
-                      borderRadius: '6px',
-                      textAlign: 'center',
-                    }}
-                  >
-                    🔒 Editor or Admin role required to upload Excel files.
+                </div>
+              </div>
+
+              {/* Card 03: Download Standardized 23-Column Blank Template */}
+              <div className="rounded-xl bg-white p-5 border border-slate-200/90 shadow-2xs flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between gap-2 mb-3">
+                      <span className="text-[11px] font-mono font-bold uppercase tracking-wider text-slate-600">
+                      03 · Standardized Schema + Picklist
+                    </span>
+                    <span className="text-[11px] text-slate-500 font-mono">
+                      2 Sheets · 23 Columns
+                    </span>
                   </div>
-                )}
+
+                  <div className="flex items-start gap-3 mb-3">
+                    <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 text-slate-800 flex items-center justify-center shrink-0">
+                      <FileSpreadsheet className="w-5 h-5 text-sky-700" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-900 m-0">
+                        Download Standardized Excel Template
+                      </h3>
+                      <p className="text-xs text-slate-600 mt-1 leading-relaxed m-0">
+                        Includes Sheet 1 (<b>Equipment Master</b> with all 23 column headers &amp; sample rows) and Sheet 2 (<b>Picklist</b> with valid Unit › Sub-Unit › System › Sub-System skip-level hierarchy rules, Format-I to Format-V, Base Line UTG, PMI, and filling guide).
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="pt-3 border-t border-slate-100">
+                  <button
+                    type="button"
+                    onClick={handleDownloadTemplate}
+                    className="w-full py-2.5 px-4 rounded-lg text-xs font-bold text-slate-800 bg-slate-100 hover:bg-slate-200/80 border border-slate-300 flex items-center justify-center gap-2 cursor-pointer transition-colors"
+                  >
+                    <Download className="w-4 h-4 text-slate-700" />
+                    <span>Download Template + Picklist (.xlsx)</span>
+                  </button>
+                </div>
               </div>
 
-              {/* Card 2: Download Blank Template */}
-              <div
-                className="card"
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  justifyContent: 'space-between',
-                  padding: '20px',
-                }}
-              >
+              {/* Card 04: Direct Bulk Report Upload & Google Drive Sync */}
+              <div className="rounded-xl bg-white p-5 border border-slate-200/90 shadow-2xs flex flex-col justify-between">
                 <div>
-                  <div style={{ fontSize: '28px', marginBottom: '8px' }}>📋</div>
-                  <h3 style={{ margin: '0 0 6px', fontSize: '15px', color: 'var(--tx)' }}>
-                    Download Blank Excel Template
-                  </h3>
-                  <p style={{ fontSize: '12px', color: 'var(--mu)', lineHeight: 1.5, margin: '0 0 16px' }}>
-                    Download the standard NREP Excel template containing all 18 required column headers (including <b>Base Line UTG</b> and <b>Document/Drawing</b>) and sample rows.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleDownloadTemplate}
-                  style={{
-                    width: '100%',
-                    background: 'var(--tr)',
-                    color: 'var(--tx)',
-                    border: '1px solid var(--bd)',
-                    padding: '10px 14px',
-                    fontSize: '12.5px',
-                    fontWeight: 700,
-                    borderRadius: '6px',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: '6px',
-                  }}
-                >
-                  <span>📥</span> Download Blank Template (.xlsx)
-                </button>
-              </div>
+                  <div className="flex items-center justify-between gap-2 mb-3">
+                    <span className="text-[11px] font-mono font-bold uppercase tracking-wider text-indigo-700">
+                      04 · Cloud Report Bridge
+                    </span>
+                    <span className="text-[11px] text-slate-500 font-mono">
+                      PDF · PNG · JPG
+                    </span>
+                  </div>
 
-              {/* Card 3: Export Current Live Database */}
-              <div
-                className="card"
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  justifyContent: 'space-between',
-                  padding: '20px',
-                }}
-              >
-                <div>
-                  <div style={{ fontSize: '28px', marginBottom: '8px' }}>💾</div>
-                  <h3 style={{ margin: '0 0 6px', fontSize: '15px', color: 'var(--tx)' }}>
-                    Export Live Database to Excel
-                  </h3>
-                  <p style={{ fontSize: '12px', color: 'var(--mu)', lineHeight: 1.5, margin: '0 0 16px' }}>
-                    Export all <b>{equipment.length}</b> equipment records with current inspection statuses, Base Line UTG, Document/Drawing, dates, and remarks.
-                  </p>
+                  <div className="flex items-start gap-3 mb-3">
+                    <div className="w-10 h-10 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-700 flex items-center justify-center shrink-0">
+                      <FolderSync className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-900 m-0">
+                        Direct Bulk Report Upload to Cloud Drive
+                      </h3>
+                      <p className="text-xs text-slate-600 mt-1 leading-relaxed m-0">
+                        Drag and drop multiple signed <b>PDF or Photo</b> inspection reports directly from your PC or phone into the central <b>Google Drive / OneDrive</b> folder.
+                      </p>
+                    </div>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleExcelDownload}
-                  style={{
-                    width: '100%',
-                    background: '#059669',
-                    color: '#fff',
-                    border: 'none',
-                    padding: '10px 14px',
-                    fontSize: '12.5px',
-                    fontWeight: 700,
-                    borderRadius: '6px',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: '6px',
-                  }}
-                >
-                  <span>⬇️</span> Export All {equipment.length} Records (.xlsx)
-                </button>
+
+                <div className="pt-3 border-t border-slate-100">
+                  {isEditor ? (
+                    <button
+                      type="button"
+                      onClick={() => setShowCloudSyncModal(true)}
+                      className="w-full py-2.5 px-4 rounded-lg text-xs font-bold text-white flex items-center justify-center gap-2 cursor-pointer transition-all shadow-xs"
+                      style={{
+                        background: 'linear-gradient(135deg, #4f46e5 0%, #3730a3 100%)',
+                      }}
+                    >
+                      <FolderSync className="w-4 h-4" />
+                      <span>Open Direct Bulk Upload &amp; Drive Sync</span>
+                    </button>
+                  ) : (
+                    <div className="py-2 px-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-xs font-medium flex items-center justify-center gap-1.5">
+                      <Lock className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                      <span>Authorized Engineer or Admin role required</span>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
-            <div className="card" style={{ padding: '18px 20px' }}>
-              <h3 style={{ margin: '0 0 8px', fontSize: '13.5px', color: 'var(--tx)' }}>
-                💡 Excel Formatting &amp; Column Guidelines (18 Columns)
-              </h3>
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
-                  gap: '12px',
-                  fontSize: '12px',
-                  color: 'var(--mu)',
-                  lineHeight: 1.6,
-                }}
-              >
-                <div>
-                  • <b>Worksheet Name:</b> <code>Equipment Master</code> (or first sheet)
-                  <br />• <b>Primary Key Column:</b> <code>Equipment Tag No.</code>
+            {/* 23-Column Schema & Formatting Specification Matrix */}
+            <div className="rounded-xl bg-white border border-slate-200/90 shadow-2xs overflow-hidden">
+              <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2">
+                  <Table2 className="w-4 h-4 text-sky-700" />
+                  <h3 className="text-xs font-extrabold uppercase tracking-wider text-slate-800 m-0">
+                    Standardized 23-Column Excel Schema Specification
+                  </h3>
                 </div>
-                <div>
-                  • <b>6 Tracked Stages:</b> Format-I, Format-II, Format-III, Internal Inspection Status, Base Line UTG, Final System Acceptance
+                <span className="text-[11px] font-mono text-slate-500">
+                  Worksheet: Equipment Master · Primary Key: Equipment Tag No.
+                </span>
+              </div>
+
+              <div className="p-5 grid grid-cols-1 md:grid-cols-3 gap-5 text-xs">
+                <div className="space-y-1.5">
+                  <div className="text-[11px] font-bold text-slate-900">
+                    01. 4-Level Skip-Aware Hierarchy &amp; Identity (7 Columns)
+                  </div>
+                  <p className="text-slate-600 leading-relaxed m-0">
+                    Maps each record to its Unit › Sub-Unit › System › Sub-System (any blank column automatically skips to the previous level):
+                  </p>
+                  <div className="font-mono text-[11px] text-sky-900 pt-1 leading-relaxed">
+                    Unit · Sub-Unit · System No. · Sub-System · Equipment Tag No. · Equipment Description · Equipment Type
+                  </div>
                 </div>
-                <div>
-                  • <b>Template Columns:</b> <code>Unit</code>, <code>Sub-Unit</code>, <code>System No.</code>, <code>Equipment Tag No.</code>, <code>Equipment Description</code>, <code>Equipment Type</code>, <code>Format-I/II/III Status &amp; Date</code>, <code>Internal Inspection Status</code>, <code>Base Line UTG</code>, <code>Punch Points Category Closed</code>, <code>Final System Acceptance</code>, <code>Document/Drawing</code>, <code>Remarks</code>
+
+                <div className="space-y-1.5 md:border-l md:border-slate-200 md:pl-5">
+                  <div className="text-[11px] font-bold text-slate-900">
+                    02. 9-Stage Inspection Pipeline &amp; Dates (14 Columns)
+                  </div>
+                  <p className="text-slate-600 leading-relaxed m-0">
+                    Tracks live completion percentages across all 7 core quality milestones (plus Base Line UTG &amp; PMI):
+                  </p>
+                  <div className="font-mono text-[11px] text-emerald-900 pt-1 leading-relaxed">
+                    Format-I Status &amp; Date · Format-II Status &amp; Date · Format-III Status &amp; Date · Format-IV Status &amp; Date · Format-V Status &amp; Date · Internal Inspection Status · Base Line UTG · PMI · Final System Acceptance
+                  </div>
+                </div>
+
+                <div className="space-y-1.5 md:border-l md:border-slate-200 md:pl-5">
+                  <div className="text-[11px] font-bold text-slate-900">
+                    03. Engineering Closeout &amp; Cloud Links (2 Columns)
+                  </div>
+                  <p className="text-slate-600 leading-relaxed m-0">
+                    Stores reference drawings, cloud report URLs, and field remarks:
+                  </p>
+                  <div className="font-mono text-[11px] text-indigo-900 pt-1 leading-relaxed">
+                    Document/Drawing · Remarks
+                  </div>
                 </div>
               </div>
             </div>
@@ -4605,7 +7794,13 @@ export default function Dashboard() {
 
         {/* TASK VIEW: ADMIN & LIVE DATABASE CONSOLE IN RIGHT PANE */}
         {viewLevel === 'admin' && (
-          <AdminPanel inline onClose={goToHome} />
+          <AdminPanel
+            inline
+            onClose={goToHome}
+            activeTabOverride={adminActiveTab}
+            onTabChange={setAdminActiveTab}
+            subActionTrigger={adminSubAction}
+          />
         )}
       </main>
 
@@ -4661,9 +7856,649 @@ export default function Dashboard() {
           onClose={() => setEditingEquipment(null)}
           onSave={async (updatedItem) => {
             await saveEquipment(updatedItem);
+            showGreenToast('Inspection Details saved successfully');
           }}
-          onDelete={isAdmin ? deleteEquipment : undefined}
+          onDelete={canAccessLiveDatabase ? deleteEquipment : undefined}
         />
+      )}
+
+      {/* LIVE IN-APP INSPECTION REPORT VIEWER & UPLOADER MODAL */}
+      {reportModalState && (
+        <InspectionReportModal
+          item={reportModalState.item}
+          canEdit={isEditor}
+          initialTab={reportModalState.tab}
+          viewOnly={Boolean(reportModalState.viewOnly)}
+          onClose={() => setReportModalState(null)}
+          onUpdated={async () => {
+            await refreshEquipment();
+            showGreenToast('Inspection Details saved successfully');
+          }}
+          onOpenCloudSync={() => setShowCloudSyncModal(true)}
+        />
+      )}
+
+      {/* GOOGLE DRIVE / ONEDRIVE LIVE FOLDER SYNCHRONIZATION MODAL */}
+      {showCloudSyncModal && (
+        <CloudFolderSyncModal
+          equipment={equipment}
+          scopeLabel={isUnitScoped ? allUnitsList.join(', ') : 'All Project Units'}
+          onClose={() => setShowCloudSyncModal(false)}
+          onSynced={async () => {
+            await refreshEquipment();
+          }}
+        />
+      )}
+
+      {/* INTERACTIVE UNIT-WISE REMARKS & COMMENTS MODAL */}
+      {remarksModalUnit && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(15, 23, 42, 0.65)',
+            backdropFilter: 'blur(3px)',
+            zIndex: 120,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+          }}
+          onClick={() => setRemarksModalUnit(null)}
+        >
+          <div
+            style={{
+              background: '#ffffff',
+              borderRadius: '12px',
+              width: '100%',
+              maxWidth: '820px',
+              maxHeight: '88vh',
+              display: 'flex',
+              flexDirection: 'column',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.28)',
+              border: '1px solid #cbd5e1',
+              overflow: 'hidden',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div
+              style={{
+                padding: '14px 18px',
+                background: 'linear-gradient(180deg, #0b2545 0%, #134074 100%)',
+                color: '#ffffff',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                borderBottom: '3px solid #0284c7',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '9px' }}>
+                <div
+                  style={{
+                    width: '32px',
+                    height: '32px',
+                    borderRadius: '8px',
+                    background: 'rgba(2, 132, 199, 0.3)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <MessageSquare size={18} color="#38bdf8" />
+                </div>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: '15.5px', fontWeight: 700, color: '#ffffff', letterSpacing: '0.2px' }}>
+                    Equipment Remarks &amp; Comments
+                  </h3>
+                  <span style={{ fontSize: '11px', color: '#bae6fd' }}>
+                    {remarksModalUnit === 'ALL' ? 'Showing all project units' : `Filtering by Unit: ${remarksModalUnit}`}
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRemarksModalUnit(null)}
+                style={{
+                  background: 'rgba(255, 255, 255, 0.15)',
+                  border: '1px solid rgba(255, 255, 255, 0.25)',
+                  color: '#ffffff',
+                  borderRadius: '6px',
+                  width: '30px',
+                  height: '30px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  fontWeight: 700,
+                }}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Quick Unit Switcher Pills */}
+            <div
+              style={{
+                padding: '8px 16px',
+                background: '#f8fafc',
+                borderBottom: '1px solid #e2e8f0',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                overflowX: 'auto',
+              }}
+            >
+              <span style={{ fontSize: '11px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', marginRight: '2px', flexShrink: 0 }}>
+                Unit:
+              </span>
+              <button
+                type="button"
+                onClick={() => setRemarksModalUnit('ALL')}
+                style={{
+                  padding: '3px 10px',
+                  fontSize: '11.5px',
+                  borderRadius: '999px',
+                  border: remarksModalUnit === 'ALL' ? '1px solid #0284c7' : '1px solid #cbd5e1',
+                  background: remarksModalUnit === 'ALL' ? '#0284c7' : '#ffffff',
+                  color: remarksModalUnit === 'ALL' ? '#ffffff' : '#334155',
+                  fontWeight: remarksModalUnit === 'ALL' ? 700 : 500,
+                  cursor: 'pointer',
+                  flexShrink: 0,
+                }}
+              >
+                All Units ({equipment.filter((i) => (i.Remarks || '').trim().length > 0).length})
+              </button>
+              {allUnitsList.map((uName) => {
+                const count = equipment.filter(
+                  (i) => i.Unit === uName && (i.Remarks || '').trim().length > 0
+                ).length;
+                const isActive = remarksModalUnit === uName;
+                return (
+                  <button
+                    key={uName}
+                    type="button"
+                    onClick={() => setRemarksModalUnit(uName)}
+                    style={{
+                      padding: '3px 10px',
+                      fontSize: '11.5px',
+                      borderRadius: '999px',
+                      border: isActive ? '1px solid #0284c7' : '1px solid #cbd5e1',
+                      background: isActive ? '#0284c7' : '#ffffff',
+                      color: isActive ? '#ffffff' : '#334155',
+                      fontWeight: isActive ? 700 : 500,
+                      cursor: 'pointer',
+                      whiteSpace: 'nowrap',
+                      flexShrink: 0,
+                    }}
+                  >
+                    {uName} ({count})
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Search Input Filter */}
+            <div style={{ padding: '10px 16px', borderBottom: '1px solid #e2e8f0', background: '#ffffff' }}>
+              <input
+                type="text"
+                className="tsf"
+                style={{ width: '100%', margin: 0, padding: '7px 12px', fontSize: '12.5px', boxSizing: 'border-box' }}
+                placeholder="🔍 Search comments, equipment tag, description, sub-unit, or system…"
+                value={remarksFilterSearch}
+                onChange={(e) => setRemarksFilterSearch(e.target.value)}
+              />
+            </div>
+
+            {/* Equipment Comments List */}
+            <div
+              style={{
+                flex: 1,
+                overflowY: 'auto',
+                padding: '14px 16px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '10px',
+                background: '#f8fafc',
+              }}
+            >
+              {(() => {
+                const itemsWithRemarks = equipment.filter((i) => {
+                  if (!(i.Remarks || '').trim()) return false;
+                  if (remarksModalUnit !== 'ALL' && i.Unit !== remarksModalUnit) return false;
+                  if (!remarksFilterSearch) return true;
+                  const q = remarksFilterSearch.toLowerCase();
+                  return (
+                    i.EquipmentTagNo?.toLowerCase().includes(q) ||
+                    i.EquipmentDescription?.toLowerCase().includes(q) ||
+                    i.Remarks?.toLowerCase().includes(q) ||
+                    i.Unit?.toLowerCase().includes(q) ||
+                    i.SystemNo?.toLowerCase().includes(q) ||
+                    i.SubUnit?.toLowerCase().includes(q)
+                  );
+                });
+
+                if (itemsWithRemarks.length === 0) {
+                  return (
+                    <div
+                      style={{
+                        textAlign: 'center',
+                        padding: '40px 16px',
+                        color: '#64748b',
+                        fontSize: '13px',
+                        background: '#ffffff',
+                        borderRadius: '8px',
+                        border: '1px solid #e2e8f0',
+                      }}
+                    >
+                      <MessageSquare size={34} color="#94a3b8" style={{ margin: '0 auto 10px', display: 'block' }} />
+                      <p style={{ margin: 0, fontWeight: 700, fontSize: '14px', color: '#334155' }}>
+                        No remarks found for this selection
+                      </p>
+                      <p style={{ margin: '4px 0 0', fontSize: '12px', color: '#94a3b8' }}>
+                        {remarksFilterSearch
+                          ? 'Try modifying your search term or select "All Units".'
+                          : 'Equipment in this unit currently has no remarks.'}
+                      </p>
+                    </div>
+                  );
+                }
+
+                return itemsWithRemarks.map((eq) => {
+                  const overallSt = getEquipmentOverallStatus(eq);
+                  return (
+                    <div
+                      key={eq.id}
+                      style={{
+                        border: '1px solid #cbd5e1',
+                        borderRadius: '8px',
+                        padding: '12px 14px',
+                        background: '#ffffff',
+                        boxShadow: '0 1px 3px rgba(15, 23, 42, 0.05)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '8px',
+                      }}
+                    >
+                      {/* Header row */}
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          flexWrap: 'wrap',
+                          gap: '6px',
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                          <a
+                            href={`#eq-${encodeURIComponent(eq.EquipmentTagNo)}`}
+                            onClick={() => setRemarksModalUnit(null)}
+                            style={{
+                              fontWeight: 700,
+                              fontSize: '14px',
+                              color: '#0284c7',
+                              textDecoration: 'none',
+                            }}
+                          >
+                            {eq.EquipmentTagNo}
+                          </a>
+                          {eq.EquipmentDescription && (
+                            <span style={{ fontSize: '12.5px', color: '#475569' }}>
+                              — {eq.EquipmentDescription}
+                            </span>
+                          )}
+                        </div>
+
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <span
+                            style={{
+                              fontSize: '10.5px',
+                              padding: '2px 7px',
+                              borderRadius: '4px',
+                              background: '#f1f5f9',
+                              color: '#334155',
+                              fontWeight: 600,
+                              border: '1px solid #e2e8f0',
+                            }}
+                          >
+                            {formatEquipmentHierarchyPath(eq)}
+                          </span>
+                          <span
+                            className={`c ${
+                              overallSt === 'Completed' ? 'cg' : overallSt === 'In progress' ? 'ca' : 'cs'
+                            }`}
+                            style={{ fontSize: '10.5px' }}
+                          >
+                            {overallSt}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Comment / Remark callout */}
+                      <div
+                        style={{
+                          background: '#f0f9ff',
+                          border: '1px solid #bae6fd',
+                          borderLeft: '4px solid #0284c7',
+                          borderRadius: '6px',
+                          padding: '9px 13px',
+                          fontSize: '13px',
+                          color: '#0c4a6e',
+                          lineHeight: 1.5,
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                          fontStyle: 'italic',
+                        }}
+                      >
+                        &ldquo;{eq.Remarks}&rdquo;
+                      </div>
+
+                      {/* Action footer */}
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          fontSize: '11px',
+                          color: '#64748b',
+                        }}
+                      >
+                        <span>
+                          {eq.updatedAt ? `Updated: ${new Date(eq.updatedAt).toLocaleDateString()}` : ''}
+                          {eq.updatedBy ? ` by ${eq.updatedBy}` : ''}
+                        </span>
+                        <a
+                          href={`#eq-${encodeURIComponent(eq.EquipmentTagNo)}`}
+                          onClick={() => setRemarksModalUnit(null)}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            color: '#0284c7',
+                            fontWeight: 700,
+                            textDecoration: 'none',
+                            padding: '3px 8px',
+                            borderRadius: '4px',
+                            background: '#e0f2fe',
+                          }}
+                        >
+                          Open Equipment Details ↗
+                        </a>
+                      </div>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+
+            {/* Modal Footer */}
+            <div
+              style={{
+                padding: '10px 16px',
+                background: '#ffffff',
+                borderTop: '1px solid #e2e8f0',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+              }}
+            >
+              <span style={{ fontSize: '12px', color: '#64748b' }}>
+                Tip: Click any equipment tag to view its full inspection stages.
+              </span>
+              <button
+                type="button"
+                onClick={() => setRemarksModalUnit(null)}
+                style={{
+                  padding: '6px 16px',
+                  fontSize: '12.5px',
+                  fontWeight: 600,
+                  borderRadius: '6px',
+                  border: '1px solid #cbd5e1',
+                  background: '#f8fafc',
+                  color: '#0f172a',
+                  cursor: 'pointer',
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Stage Drilldown Modal with Hyperlinks, Completion Dates & User IDs */}
+      {stageDrilldownModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 1000,
+            background: 'rgba(15, 23, 42, 0.65)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+          }}
+          onClick={() => setStageDrilldownModal(null)}
+        >
+          <div
+            style={{
+              background: '#ffffff',
+              borderRadius: '12px',
+              border: '1px solid #cbd5e1',
+              width: '100%',
+              maxWidth: '860px',
+              maxHeight: '85vh',
+              display: 'flex',
+              flexDirection: 'column',
+              boxShadow: '0 25px 50px -12px rgba(15, 23, 42, 0.25)',
+              overflow: 'hidden',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div
+              style={{
+                padding: '14px 18px',
+                background: '#f8fafc',
+                borderBottom: '1px solid #e2e8f0',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+              }}
+            >
+              <div>
+                <h3 style={{ margin: 0, fontSize: '15px', color: '#0f172a', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span>Stage Drilldown: {stageDrilldownModal.col.label}</span>
+                  <span style={{ fontSize: '11px', fontWeight: 600, padding: '2px 8px', borderRadius: '4px', background: '#e0f2fe', color: '#0369a1', border: '1px solid #bae6fd' }}>
+                    Required: {stageDrilldownModal.col.doneValue}
+                  </span>
+                </h3>
+                <span style={{ fontSize: '11.5px', color: '#64748b' }}>
+                  Equipment items that completed this stage, along with completion dates and user IDs.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setStageDrilldownModal(null)}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  fontSize: '18px',
+                  cursor: 'pointer',
+                  color: '#64748b',
+                  padding: '4px',
+                }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Modal Search & Summary Bar */}
+            <div style={{ padding: '10px 18px', borderBottom: '1px solid #e2e8f0', background: '#ffffff', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                placeholder="🔍 Search tag, description, unit, system, date, user ID…"
+                value={stageDrilldownSearch}
+                onChange={(e) => setStageDrilldownSearch(e.target.value)}
+                style={{ flex: 1, minWidth: '260px', padding: '6px 10px', fontSize: '12px', borderRadius: '6px', border: '1px solid #cbd5e1' }}
+              />
+              <span style={{ fontSize: '12px', color: '#64748b', fontWeight: 600 }}>
+                {stageDrilldownModal.items.filter((item) => {
+                  const val = (item[stageDrilldownModal.col.key] as string) || '';
+                  if (!isDone(val)) return false;
+                  if (!stageDrilldownSearch) return true;
+                  const q = stageDrilldownSearch.toLowerCase();
+                  const dateVal = getStageDate(item, stageDrilldownModal.col.key);
+                  const userVal = item.updatedBy || 'System / Admin';
+                  return (
+                    item.EquipmentTagNo?.toLowerCase().includes(q) ||
+                    item.EquipmentDescription?.toLowerCase().includes(q) ||
+                    item.Unit?.toLowerCase().includes(q) ||
+                    item.SystemNo?.toLowerCase().includes(q) ||
+                    dateVal.toLowerCase().includes(q) ||
+                    userVal.toLowerCase().includes(q)
+                  );
+                }).length} completed of {stageDrilldownModal.items.length} total
+              </span>
+            </div>
+
+            {/* Modal Equipment Table */}
+            <div style={{ flex: 1, overflowY: 'auto', padding: '0 18px' }}>
+              <table className="nrep-table" style={{ width: '100%', fontSize: '12px' }}>
+                <thead style={{ position: 'sticky', top: 0, background: '#f8fafc', zIndex: 2 }}>
+                  <tr>
+                    <th>Tag No.</th>
+                    <th>Description</th>
+                    <th>Unit / System Path</th>
+                    <th>Status</th>
+                    <th>Completion / Issue Date</th>
+                    <th>User ID / By</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stageDrilldownModal.items
+                    .filter((item) => {
+                      const val = (item[stageDrilldownModal.col.key] as string) || '';
+                      if (!isDone(val)) return false;
+                      if (!stageDrilldownSearch) return true;
+                      const q = stageDrilldownSearch.toLowerCase();
+                      const dateVal = getStageDate(item, stageDrilldownModal.col.key);
+                      const userVal = item.updatedBy || 'System / Admin';
+                      return (
+                        item.EquipmentTagNo?.toLowerCase().includes(q) ||
+                        item.EquipmentDescription?.toLowerCase().includes(q) ||
+                        item.Unit?.toLowerCase().includes(q) ||
+                        item.SystemNo?.toLowerCase().includes(q) ||
+                        dateVal.toLowerCase().includes(q) ||
+                        userVal.toLowerCase().includes(q)
+                      );
+                    })
+                    .map((item) => {
+                      const dateVal = getStageDate(item, stageDrilldownModal.col.key);
+                      const userVal = item.updatedBy || 'System / Admin';
+                      const statusVal = (item[stageDrilldownModal.col.key] as string) || '—';
+                      return (
+                        <tr key={item.id}>
+                          <td>
+                            <a
+                              href={`#eq-${encodeURIComponent(item.EquipmentTagNo)}`}
+                              onClick={() => setStageDrilldownModal(null)}
+                              style={{ fontWeight: 700, color: '#0284c7', textDecoration: 'underline' }}
+                            >
+                              🔗 {item.EquipmentTagNo}
+                            </a>
+                          </td>
+                          <td>{item.EquipmentDescription || '—'}</td>
+                          <td>
+                            <span style={{ fontSize: '11px', color: '#334155' }}>
+                              {formatEquipmentHierarchyPath(item)}
+                            </span>
+                          </td>
+                          <td>
+                            <span className="c cg" style={{ fontSize: '10.5px' }}>
+                              {statusVal}
+                            </span>
+                          </td>
+                          <td>
+                            <span style={{ fontFamily: 'var(--mono)', fontSize: '11.5px', color: '#0f172a', fontWeight: 600 }}>
+                              📅 {dateVal}
+                            </span>
+                          </td>
+                          <td>
+                            <span style={{ fontSize: '11.5px', color: '#0369a1', fontWeight: 600 }}>
+                              👤 {userVal}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Modal Footer */}
+            <div style={{ padding: '12px 18px', background: '#f8fafc', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontSize: '11.5px', color: '#64748b' }}>
+                💡 Click any Equipment Tag No. hyperlink to open its full inspection details.
+              </span>
+              <button
+                type="button"
+                onClick={() => setStageDrilldownModal(null)}
+                style={{ padding: '6px 16px', fontSize: '12px', fontWeight: 600, borderRadius: '6px', border: '1px solid #cbd5e1', background: '#ffffff', color: '#0f172a', cursor: 'pointer' }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Real-Time Animated Upload Progress Popup for Excel Upload */}
+      <UploadProgressPopup
+        open={Boolean(uploadingExcelFile)}
+        title="Uploading & Syncing Excel Master Data..."
+        fileName={uploadingExcelFile || ''}
+        destinationLabel="Supabase Cloud Database"
+      />
+
+      {/* SweetAlert-Style Success Popup for Dashboard Excel Upload */}
+      <SweetSuccessPopup
+        open={Boolean(dashboardSweetSuccess)}
+        title={dashboardSweetSuccess?.title || 'Success!'}
+        message={dashboardSweetSuccess?.message || ''}
+        badgeText={dashboardSweetSuccess?.badgeText}
+        metaItems={dashboardSweetSuccess?.metaItems}
+        confirmLabel="OK, Awesome!"
+        onClose={() => setDashboardSweetSuccess(null)}
+      />
+
+      {/* Mint-Green Popup Toast Window matching reference screenshot image_073d974d */}
+      {greenToast?.visible && (
+        <div
+          role="status"
+          className="fixed top-6 right-6 z-[9999] flex items-center justify-between gap-5 px-4 py-3 rounded-[3px] shadow-lg text-white select-none transition-all duration-200 animate-in fade-in slide-in-from-top-2"
+          style={{
+            backgroundColor: '#7de2a4',
+            minWidth: '330px',
+            maxWidth: '92vw',
+          }}
+        >
+          <span className="font-bold text-white text-[13px] tracking-tight antialiased">
+            {greenToast.message}
+          </span>
+          <button
+            type="button"
+            onClick={() => setGreenToast(null)}
+            className="text-gray-600 hover:text-gray-900 transition-colors p-0.5 cursor-pointer ml-3 flex items-center justify-center"
+            aria-label="Close notification"
+          >
+            <X className="w-4 h-4 stroke-[2.5]" />
+          </button>
+        </div>
       )}
     </>
   );

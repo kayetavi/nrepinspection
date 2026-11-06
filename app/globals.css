@@ -66,15 +66,17 @@ header.nrep-header {
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
-  padding: 10px 16px;
+  padding: 7px 16px;
+  min-height: 46px;
   position: relative;
   flex-shrink: 0;
   z-index: 40;
-  border-bottom: 3px solid var(--ac);
+  border-bottom: 2.5px solid var(--ac);
 }
 header.nrep-header h1 {
   margin: 0;
-  font-size: 16px;
+  font-size: 15px;
+  line-height: 1.2;
   letter-spacing: 0.4px;
   flex: 1 1 240px;
   text-transform: uppercase;
@@ -83,8 +85,9 @@ header.nrep-header h1 {
 header.nrep-header h1 small {
   display: block;
   font-weight: 400;
-  font-size: 11px;
-  opacity: 0.7;
+  font-size: 10.5px;
+  margin-top: 1px;
+  opacity: 0.75;
   text-transform: none;
   letter-spacing: 0;
   color: #ffffff;
@@ -93,8 +96,8 @@ header.nrep-header button {
   background: transparent;
   color: #fff;
   border-color: rgba(255, 255, 255, 0.35);
-  font-size: 13px;
-  padding: 6px 10px;
+  font-size: 12.5px;
+  padding: 5px 10px;
   border-radius: 5px;
   display: inline-flex;
   align-items: center;
@@ -115,13 +118,15 @@ header.nrep-header button.on {
   border-color: var(--am);
 }
 header.nrep-header .ib {
-  font-size: 18px;
+  font-size: 16px;
   line-height: 1;
-  padding: 7px 12px;
+  padding: 6px 11px;
 }
-header.nrep-header #hm {
-  font-size: 13.5px;
+header.nrep-header #hm,
+header.nrep-header #hb {
+  font-size: 12.5px;
   font-weight: 600;
+  padding: 5px 10px;
 }
 
 /* Search bar */
@@ -132,10 +137,10 @@ header.nrep-header #hm {
   align-items: center;
 }
 .gs input {
-  width: 195px;
-  height: 30px;
-  padding: 4px 26px 4px 28px;
-  font-size: 12.5px;
+  width: 190px;
+  height: 28px;
+  padding: 4px 25px 4px 27px;
+  font-size: 12px;
   background: rgba(255, 255, 255, 0.14);
   color: #fff;
   border-color: rgba(255, 255, 255, 0.35);
@@ -190,8 +195,8 @@ header.nrep-header #hm {
   font-weight: 600;
 }
 
-/* Flyout Tree Drawer */
-#tree {
+/* Flyout Tree Drawer & Hierarchy Drawer */
+#tree, #hierarchy-tree {
   position: fixed;
   top: 0;
   left: 0;
@@ -207,7 +212,7 @@ header.nrep-header #hm {
   overflow-y: auto;
   box-shadow: 4px 0 18px rgba(0, 0, 0, 0.3);
 }
-#tree.show {
+#tree.show, #hierarchy-tree.show {
   transform: none;
 }
 #bk {
@@ -621,8 +626,14 @@ td.pz {
   color: var(--gr);
   text-align: center;
 }
-th.ct {
-  text-align: center;
+th.ct,
+td.ct,
+.ct {
+  text-align: center !important;
+}
+table.nrep-table th.ct,
+table.nrep-table td.ct {
+  text-align: center !important;
 }
 
 /* Status Chips */
@@ -852,4 +863,29 @@ footer.nrep-footer button:hover {
   min-height: 18px;
   font-size: 12.5px;
   margin-top: 10px;
+}
+
+/* Dual container layout for Unit-wise Status & Unit-wise Remarks */
+.unit-overview-dual-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 12px;
+  margin-bottom: 12px;
+  align-items: stretch;
+}
+@media (max-width: 1040px) {
+  .unit-overview-dual-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.unit-remarks-card {
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+.unit-remarks-card:hover {
+  background: #f0f9ff !important;
+  border-color: #0284c7 !important;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(2, 132, 199, 0.12);
 }

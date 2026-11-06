@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { EquipmentItem, STATUS_COLUMNS, isDone, calculateProgress } from '@/lib/types';
+import { EquipmentItem, STATUS_COLUMNS, isDone, calculateProgress, formatEquipmentHierarchyPath } from '@/lib/types';
 import { useEquipment } from '@/lib/equipment-context';
 import { useAuth } from '@/lib/auth-context';
 import { ExternalLink, Check, AlertCircle, Save, Trash2, X } from 'lucide-react';
@@ -27,7 +27,7 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
     setMsg(null);
     try {
       await saveEquipment(formData);
-      setMsg({ text: 'Changes saved directly to Cloud Firestore', type: 'success' });
+      setMsg({ text: 'Changes saved directly to Supabase Cloud', type: 'success' });
       setTimeout(() => setMsg(null), 3000);
     } catch (err: any) {
       setMsg({ text: err.message || 'Save failed', type: 'error' });
@@ -54,10 +54,8 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
           <div>
             <div className="flex items-center gap-2">
               <span className="font-mono text-xs uppercase px-2 py-0.5 rounded bg-sky-800 text-sky-200 font-semibold">
-                {formData.Unit}
+                {formatEquipmentHierarchyPath(formData)}
               </span>
-              <span className="text-xs text-sky-300">·</span>
-              <span className="text-xs text-sky-300">{formData.SystemNo}</span>
             </div>
             <h2 className="text-lg font-bold tracking-tight mt-1 flex items-center gap-2">
               {formData.EquipmentTagNo}
@@ -94,13 +92,13 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
           <div>
             <div className="flex items-center justify-between mb-3">
               <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                Inspection Milestone Pipeline (6 Stages)
+                Inspection Milestone Pipeline ({STATUS_COLUMNS.length} Stages)
               </h4>
               <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-sky-100 text-sky-900 border border-sky-200">
                 Stage Progress: {calculateProgress([formData])}%
               </span>
             </div>
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
               {STATUS_COLUMNS.map((col) => {
                 const rawVal = (formData[col.key] as string) || '';
                 const val = col.options.includes(rawVal as any)
@@ -147,7 +145,7 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
               <input
                 type="text"
                 disabled={!isEditor}
-                value={formData.EquipmentTagNo}
+                value={formData.EquipmentTagNo ?? ''}
                 onChange={(e) => handleChange('EquipmentTagNo', e.target.value)}
                 className="w-full px-3 py-1.5 rounded-lg border border-slate-200 font-mono text-xs bg-white disabled:bg-slate-50"
               />
@@ -157,7 +155,7 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
               <input
                 type="text"
                 disabled={!isEditor}
-                value={formData.EquipmentType || ''}
+                value={formData.EquipmentType ?? ''}
                 onChange={(e) => handleChange('EquipmentType', e.target.value)}
                 placeholder="e.g. Tank, Vessel, Pump, Motor"
                 className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
@@ -168,30 +166,44 @@ export default function EquipmentDetailModal({ item, onClose }: EquipmentDetailM
               <input
                 type="text"
                 disabled={!isEditor}
-                value={formData.Unit}
+                value={formData.Unit ?? ''}
                 onChange={(e) => handleChange('Unit', e.target.value)}
                 className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
               />
             </div>
 
             <div>
-              <label className="block text-slate-500 font-medium mb-1">System No. & Details</label>
+              <label className="block text-slate-500 font-medium mb-1">Sub-Unit (Optional)</label>
               <input
                 type="text"
                 disabled={!isEditor}
-                value={formData.SystemNo}
+                value={formData.SubUnit ?? ''}
+                placeholder="Leave blank to skip"
+                onChange={(e) => handleChange('SubUnit', e.target.value)}
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
+              />
+            </div>
+
+            <div>
+              <label className="block text-slate-500 font-medium mb-1">System No. (Optional)</label>
+              <input
+                type="text"
+                disabled={!isEditor}
+                value={formData.SystemNo ?? ''}
+                placeholder="Leave blank to skip"
                 onChange={(e) => handleChange('SystemNo', e.target.value)}
                 className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
               />
             </div>
+
             <div>
-              <label className="block text-slate-500 font-medium mb-1">Punch Points Category Closed</label>
+              <label className="block text-slate-500 font-medium mb-1">Sub-System (Optional)</label>
               <input
                 type="text"
                 disabled={!isEditor}
-                value={formData.PunchPointsCategoryClosed || ''}
-                onChange={(e) => handleChange('PunchPointsCategoryClosed', e.target.value)}
-                placeholder="e.g. A, B, or All Closed"
+                value={formData.SubSystem ?? ''}
+                placeholder="Leave blank to skip"
+                onChange={(e) => handleChange('SubSystem', e.target.value)}
                 className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white disabled:bg-slate-50"
               />
             </div>
